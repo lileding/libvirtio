@@ -48,19 +48,46 @@ pub struct BlockCompletion {
 #[derive(Clone, Debug)]
 pub struct BlockDeclaration {
     own_imm_path: PathBuf,
+    imm_capacity: u64,
     imm_queue_count: usize,
     imm_maximum_queue_size: u16,
     imm_read_only: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockConfig {
+    pub capacity_sectors: u64,
+    pub read_only: bool,
+    pub queue_count: u16,
+}
+
 impl BlockDeclaration {
-    pub fn new(path: impl Into<PathBuf>, queue_count: usize, maximum_queue_size: u16) -> Self {
-        Self {
-            own_imm_path: path.into(),
+    pub fn open(
+        path: impl Into<PathBuf>,
+        queue_count: usize,
+        maximum_queue_size: u16,
+    ) -> Result<Self, DeviceError> {
+        let path = path.into();
+        let metadata = std::fs::metadata(&path)?;
+        let capacity = metadata.len();
+        if !metadata.file_type().is_file()
+            || capacity == 0
+            || capacity % VIRTIO_BLK_SECTOR_SIZE != 0
+        {
+            return Err(DeviceError::InvalidLayout(
+                "block image must be a non-zero sector-aligned regular file",
+            ));
+        }
+        if queue_count == 0 || queue_count > usize::from(u16::MAX) {
+            return Err(DeviceError::InvalidLayout("invalid block queue count"));
+        }
+        Ok(Self {
+            own_imm_path: path,
+            imm_capacity: capacity,
             imm_queue_count: queue_count,
             imm_maximum_queue_size: maximum_queue_size,
             imm_read_only: false,
-        }
+        })
     }
 
     pub fn read_only(mut self) -> Self {
@@ -70,6 +97,14 @@ impl BlockDeclaration {
 
     pub fn path(&self) -> &Path {
         &self.own_imm_path
+    }
+
+    pub fn config(&self) -> BlockConfig {
+        BlockConfig {
+            capacity_sectors: self.imm_capacity / VIRTIO_BLK_SECTOR_SIZE,
+            read_only: self.imm_read_only,
+            queue_count: u16::try_from(self.imm_queue_count).expect("validated queue count"),
+        }
     }
 }
 
@@ -93,9 +128,9 @@ impl BlockDevice {
             .write(!declaration.imm_read_only)
             .open(&declaration.own_imm_path)?;
         let capacity = file.metadata()?.len();
-        if capacity == 0 || capacity % VIRTIO_BLK_SECTOR_SIZE != 0 {
+        if capacity != declaration.imm_capacity {
             return Err(DeviceError::InvalidLayout(
-                "block image must have a non-zero sector-aligned size",
+                "block image changed after declaration",
             ));
         }
         let queue_count = resources.queues.len();
@@ -447,8 +482,6 @@ impl DeviceInstance for BlockDevice {
 
     async fn shutdown(&self, _reason: DeviceDownReason) -> Result<(), DeviceError> {
         self.atomic_mut_down.store(true, Ordering::Release);
-        self.own_imm_resources.dma.revoke();
-        self.own_imm_resources.dma.wait_for_drain().await;
         Ok(())
     }
 }
@@ -543,7 +576,7 @@ mod tests {
         memory[0x200..0x204].copy_from_slice(&(0u32).to_le_bytes());
         memory[0x208..0x210].copy_from_slice(&(1u64).to_le_bytes());
 
-        let declaration = BlockDeclaration::new(&path, 1, 128);
+        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
         let device = BlockDevice::open(
             &declaration,
             resources(&mut memory, Arc::new(TestNotifier::default())),
@@ -610,7 +643,7 @@ mod tests {
         memory[0x84..0x86].copy_from_slice(&0u16.to_le_bytes());
 
         let notifier = Arc::new(TestNotifier::default());
-        let declaration = BlockDeclaration::new(&path, 1, 128);
+        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
         let device = BlockDevice::open(&declaration, resources(&mut memory, notifier.clone()))
             .expect("open image");
         device.kick();
@@ -681,7 +714,7 @@ mod tests {
         memory[0x208..0x210].copy_from_slice(&(2u64).to_le_bytes());
         memory[0x300..0x304].copy_from_slice(b"out\n");
 
-        let declaration = BlockDeclaration::new(&path, 1, 128);
+        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
         let device = BlockDevice::open(
             &declaration,
             resources(&mut memory, Arc::new(TestNotifier::default())),
@@ -722,6 +755,22 @@ mod tests {
             .shutdown(DeviceDownReason::Stop)
             .await
             .expect("shutdown");
+        fs::remove_file(path).expect("remove image");
+    }
+
+    #[test]
+    fn declaration_exposes_immutable_block_config() {
+        let path = image_path();
+        fs::write(&path, vec![0u8; 4096]).expect("create image");
+        let declaration = BlockDeclaration::open(&path, 4, 128).expect("declare image");
+        assert_eq!(
+            declaration.config(),
+            super::BlockConfig {
+                capacity_sectors: 8,
+                read_only: false,
+                queue_count: 4,
+            }
+        );
         fs::remove_file(path).expect("remove image");
     }
 }

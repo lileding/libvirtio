@@ -10,7 +10,7 @@ pub mod error;
 pub mod interrupt;
 pub mod queue;
 
-pub use block::{BlockDeclaration, BlockDevice};
+pub use block::{BlockConfig, BlockDeclaration, BlockDevice};
 pub use device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
 pub use dma::{DmaLease, DmaMemory, DmaPart, DmaRange, DmaSegment};
 pub use error::{DeviceDownReason, DeviceError};
