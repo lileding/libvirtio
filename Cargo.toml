@@ -1,5 +1,5 @@
 [package]
-name = "libvirtiod"
+name = "virtiod"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-2-Clause"
@@ -11,3 +11,6 @@ futures-util = "0.3"
 libc = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync"] }
+
+[lib]
+crate-type = ["rlib", "cdylib"]
