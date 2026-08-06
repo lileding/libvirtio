@@ -1,10 +1,11 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use futures_util::future::join_all;
-use tokio::sync::Mutex;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::{Mutex, Notify};
 
 use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
 use crate::dma::{DmaLease, DmaMemory, DmaRange};
@@ -23,6 +24,8 @@ pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 const VIRTIO_BLK_HEADER_SIZE: usize = 16;
 const VIRTIO_BLK_SECTOR_SIZE: u64 = 512;
+const MAXIMUM_INFLIGHT_PER_QUEUE: usize = 4;
+const MAXIMUM_INFLIGHT_REQUESTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockRequestType {
@@ -115,8 +118,19 @@ pub struct BlockDevice {
     imm_read_only: bool,
     imm_capacity: u64,
     own_mut_queue_states: Mutex<Vec<QueueState>>,
-    atomic_mut_kicked: AtomicBool,
+    own_imm_wake: Notify,
     atomic_mut_down: AtomicBool,
+}
+
+struct BlockWork {
+    imm_queue_index: usize,
+    own_imm_chain: DescriptorChain,
+    own_imm_request: BlockRequest,
+}
+
+struct BlockWorkCompletion {
+    own_imm_work: BlockWork,
+    imm_completion: BlockCompletion,
 }
 
 impl BlockDevice {
@@ -141,17 +155,13 @@ impl BlockDevice {
             imm_read_only: declaration.imm_read_only,
             imm_capacity: capacity,
             own_mut_queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
-            atomic_mut_kicked: AtomicBool::new(false),
+            own_imm_wake: Notify::new(),
             atomic_mut_down: AtomicBool::new(false),
         })
     }
 
     pub fn resources(&self) -> &DeviceResources {
         &self.own_imm_resources
-    }
-
-    pub fn take_kick(&self) -> bool {
-        self.atomic_mut_kicked.swap(false, Ordering::AcqRel)
     }
 
     pub fn parse_request(
@@ -237,9 +247,10 @@ impl BlockDevice {
         let file = self.own_imm_file.try_clone()?;
         let capacity = self.imm_capacity;
         let read_only = self.imm_read_only;
+        let flush_supported = self.own_imm_resources.negotiated_features & VIRTIO_BLK_F_FLUSH != 0;
         tokio::task::spawn_blocking(move || {
             let (completion, status_value) =
-                execute_blocking(file, capacity, read_only, request, payload)?;
+                execute_blocking(file, capacity, read_only, flush_supported, request, payload)?;
             write_status(status, status_value)?;
             Ok(completion)
         })
@@ -254,7 +265,7 @@ impl BlockDevice {
         Ok(())
     }
 
-    async fn process_queue(&self, queue_index: usize) -> Result<bool, DeviceError> {
+    async fn take_work(&self, queue_index: usize) -> Result<Option<BlockWork>, DeviceError> {
         let queue_layout = *self
             .own_imm_resources
             .queues
@@ -266,17 +277,37 @@ impl BlockDevice {
             queue.pop(&self.own_imm_resources.dma, &mut states[queue_index])?
         };
         let Some(chain) = chain else {
-            return Ok(false);
+            return Ok(None);
         };
         let request = Self::parse_request(&self.own_imm_resources.dma, &chain)?;
-        let completion = self.execute(&self.own_imm_resources.dma, request).await?;
+        Ok(Some(BlockWork {
+            imm_queue_index: queue_index,
+            own_imm_chain: chain,
+            own_imm_request: request,
+        }))
+    }
+
+    async fn execute_work(&self, work: BlockWork) -> Result<BlockWorkCompletion, DeviceError> {
+        let completion = self
+            .execute(&self.own_imm_resources.dma, work.own_imm_request.clone())
+            .await?;
+        Ok(BlockWorkCompletion {
+            own_imm_work: work,
+            imm_completion: completion,
+        })
+    }
+
+    async fn complete_work(&self, completion: BlockWorkCompletion) -> Result<(), DeviceError> {
+        let queue_index = completion.own_imm_work.imm_queue_index;
+        let queue_layout = self.own_imm_resources.queues[queue_index];
+        let queue = VirtQueue::new(queue_layout, &self.own_imm_resources.dma)?;
         {
             let mut states = self.own_mut_queue_states.lock().await;
             queue.complete(
                 &self.own_imm_resources.dma,
                 &mut states[queue_index],
-                &chain,
-                completion.used_length,
+                &completion.own_imm_work.own_imm_chain,
+                completion.imm_completion.used_length,
             )?;
         }
         let notifier = self.own_imm_resources.interrupts.get(queue_index).ok_or(
@@ -289,8 +320,7 @@ impl BlockDevice {
                 vector: u16::try_from(queue_index)
                     .map_err(|_| DeviceError::InvalidLayout("vector exceeds u16"))?,
             })
-            .await?;
-        Ok(true)
+            .await
     }
 }
 
@@ -327,11 +357,12 @@ fn execute_blocking(
     file: File,
     capacity: u64,
     read_only: bool,
+    flush_supported: bool,
     request: BlockRequest,
     mut payload: Vec<DmaLease>,
 ) -> Result<(BlockCompletion, u8), DeviceError> {
     let status = match request.request_type {
-        BlockRequestType::Flush => {
+        BlockRequestType::Flush if flush_supported => {
             if !payload.is_empty() {
                 return Err(DeviceError::Descriptor("block flush has payload"));
             }
@@ -341,6 +372,7 @@ fn execute_blocking(
                 VIRTIO_BLK_S_IOERR
             }
         }
+        BlockRequestType::Flush => VIRTIO_BLK_S_UNSUPP,
         BlockRequestType::Unsupported(_) => VIRTIO_BLK_S_UNSUPP,
         BlockRequestType::In | BlockRequestType::Out => {
             let offset = request
@@ -441,51 +473,90 @@ impl DeviceDeclaration for BlockDeclaration {
             queue_count: self.imm_queue_count,
             maximum_queue_size: self.imm_maximum_queue_size,
             notifier_count: self.imm_queue_count,
-            required_features: VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH,
-            optional_features: 0,
+            required_features: VIRTIO_F_VERSION_1,
+            optional_features: VIRTIO_BLK_F_FLUSH,
         }
     }
 
     async fn activate(
         &self,
         resources: DeviceResources,
-    ) -> Result<Box<dyn DeviceInstance>, DeviceError> {
+    ) -> Result<Arc<dyn DeviceInstance>, DeviceError> {
         resources.validate(&self.layout())?;
-        Ok(Box::new(BlockDevice::open(self, resources)?))
+        Ok(Arc::new(BlockDevice::open(self, resources)?))
     }
 }
 
 #[async_trait]
 impl DeviceInstance for BlockDevice {
     fn kick(&self) {
-        self.atomic_mut_kicked.store(true, Ordering::Release);
+        self.own_imm_wake.notify_one();
     }
 
-    async fn process_kick(&self) -> Result<(), DeviceError> {
-        if !self.take_kick() {
-            return Ok(());
-        }
-        loop {
-            let results = join_all(
-                (0..self.own_imm_resources.queues.len())
-                    .map(|queue_index| self.process_queue(queue_index)),
-            )
-            .await;
-            let mut did_work = false;
-            for result in results {
-                did_work |= result?;
-            }
-            if !did_work {
-                return Ok(());
-            }
-        }
-    }
-
-    async fn shutdown(&self, _reason: DeviceDownReason) -> Result<(), DeviceError> {
+    fn stop(&self, _reason: DeviceDownReason) {
         self.atomic_mut_down.store(true, Ordering::Release);
         self.own_imm_resources.dma.revoke();
-        self.own_imm_resources.dma.wait_for_drain().await;
-        Ok(())
+        self.own_imm_wake.notify_waiters();
+    }
+
+    async fn run(&self) -> Result<(), DeviceError> {
+        let maximum_inflight = self
+            .own_imm_resources
+            .queues
+            .len()
+            .saturating_mul(MAXIMUM_INFLIGHT_PER_QUEUE)
+            .clamp(1, MAXIMUM_INFLIGHT_REQUESTS);
+        let mut pending = FuturesUnordered::new();
+        let mut next_queue = 0usize;
+        let mut scan_queues = false;
+        loop {
+            if !scan_queues && pending.is_empty() && !self.atomic_mut_down.load(Ordering::Acquire) {
+                let notified = self.own_imm_wake.notified();
+                if !self.atomic_mut_down.load(Ordering::Acquire) {
+                    notified.await;
+                    scan_queues = true;
+                }
+            }
+            while !self.atomic_mut_down.load(Ordering::Acquire)
+                && scan_queues
+                && pending.len() < maximum_inflight
+            {
+                let mut work = None;
+                for _ in 0..self.own_imm_resources.queues.len() {
+                    let queue_index = next_queue % self.own_imm_resources.queues.len();
+                    next_queue = next_queue.wrapping_add(1);
+                    if let Some(next) = self.take_work(queue_index).await? {
+                        work = Some(next);
+                        break;
+                    }
+                }
+                let Some(work) = work else {
+                    break;
+                };
+                pending.push(self.execute_work(work));
+            }
+            scan_queues = false;
+
+            if self.atomic_mut_down.load(Ordering::Acquire) && pending.is_empty() {
+                self.own_imm_resources.dma.wait_for_drain().await;
+                return Ok(());
+            }
+
+            if pending.is_empty() {
+                continue;
+            }
+
+            tokio::select! {
+                result = pending.next() => {
+                    let completion = result.expect("pending completion exists")?;
+                    if !self.atomic_mut_down.load(Ordering::Acquire) {
+                        self.complete_work(completion).await?;
+                        scan_queues = true;
+                    }
+                }
+                _ = self.own_imm_wake.notified() => { scan_queues = true; }
+            }
+        }
     }
 }
 
@@ -562,10 +633,8 @@ mod tests {
         let path = image_path();
         fs::write(&path, vec![0u8; 512]).expect("create image");
         let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
-        assert_eq!(
-            declaration.layout().required_features,
-            VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH
-        );
+        assert_eq!(declaration.layout().required_features, VIRTIO_F_VERSION_1);
+        assert_eq!(declaration.layout().optional_features, VIRTIO_BLK_F_FLUSH);
         fs::remove_file(path).expect("remove image");
     }
 
@@ -626,10 +695,7 @@ mod tests {
         );
         drop(status);
         drop(payload);
-        device
-            .shutdown(DeviceDownReason::Stop)
-            .await
-            .expect("shutdown");
+        device.stop(DeviceDownReason::Stop);
         fs::remove_file(path).expect("remove image");
     }
 
@@ -661,8 +727,16 @@ mod tests {
         let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
         let device = BlockDevice::open(&declaration, resources(&mut memory, notifier.clone()))
             .expect("open image");
-        device.kick();
-        device.process_kick().await.expect("process kick");
+        let work = device
+            .take_work(0)
+            .await
+            .expect("take queue work")
+            .expect("available work");
+        let completion = device.execute_work(work).await.expect("execute work");
+        device
+            .complete_work(completion)
+            .await
+            .expect("complete work");
 
         let used = device
             .resources()
@@ -701,10 +775,7 @@ mod tests {
         );
         drop(status);
         assert_eq!(notifier.atomic_mut_count.load(Ordering::Acquire), 1);
-        device
-            .shutdown(DeviceDownReason::Stop)
-            .await
-            .expect("shutdown");
+        device.stop(DeviceDownReason::Stop);
         fs::remove_file(path).expect("remove image");
     }
 
@@ -766,10 +837,7 @@ mod tests {
             .await
             .expect("flush execute");
         assert_eq!(completion.status, VIRTIO_BLK_S_OK);
-        device
-            .shutdown(DeviceDownReason::Stop)
-            .await
-            .expect("shutdown");
+        device.stop(DeviceDownReason::Stop);
         fs::remove_file(path).expect("remove image");
     }
 

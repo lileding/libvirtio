@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
 use crate::dma::{DmaMemory, DmaRange};
@@ -143,6 +143,7 @@ struct VsockDevice {
     own_imm_resources: DeviceResources,
     own_imm_backend: Arc<dyn VsockBackend>,
     own_mut_queue_states: Mutex<Vec<QueueState>>,
+    own_imm_wake: Notify,
     atomic_mut_kicked: AtomicBool,
     atomic_mut_down: AtomicBool,
 }
@@ -162,10 +163,11 @@ impl DeviceDeclaration for VsockDeclaration {
     async fn activate(
         &self,
         resources: DeviceResources,
-    ) -> Result<Box<dyn DeviceInstance>, DeviceError> {
+    ) -> Result<Arc<dyn DeviceInstance>, DeviceError> {
         resources.validate(&self.layout())?;
-        Ok(Box::new(VsockDevice {
+        Ok(Arc::new(VsockDevice {
             own_mut_queue_states: Mutex::new(vec![QueueState::new(); QUEUE_COUNT]),
+            own_imm_wake: Notify::new(),
             own_imm_resources: resources,
             own_imm_backend: Arc::clone(&self.own_imm_backend),
             atomic_mut_kicked: AtomicBool::new(false),
@@ -178,25 +180,34 @@ impl DeviceDeclaration for VsockDeclaration {
 impl DeviceInstance for VsockDevice {
     fn kick(&self) {
         self.atomic_mut_kicked.store(true, Ordering::Release);
+        self.own_imm_wake.notify_one();
     }
 
-    async fn process_kick(&self) -> Result<(), DeviceError> {
-        if self.atomic_mut_down.load(Ordering::Acquire) {
-            return Err(DeviceError::Down(DeviceDownReason::Stop));
-        }
-        if !self.atomic_mut_kicked.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        self.process_tx().await?;
-        self.process_rx().await?;
-        self.process_event().await
-    }
-
-    async fn shutdown(&self, _reason: DeviceDownReason) -> Result<(), DeviceError> {
+    fn stop(&self, _reason: DeviceDownReason) {
         self.atomic_mut_down.store(true, Ordering::Release);
         self.own_imm_resources.dma.revoke();
-        self.own_imm_resources.dma.wait_for_drain().await;
-        Ok(())
+        self.own_imm_wake.notify_waiters();
+    }
+
+    async fn run(&self) -> Result<(), DeviceError> {
+        loop {
+            let notified = self.own_imm_wake.notified();
+            if self.atomic_mut_down.load(Ordering::Acquire) {
+                self.own_imm_resources.dma.wait_for_drain().await;
+                return Ok(());
+            }
+            notified.await;
+            if self.atomic_mut_down.load(Ordering::Acquire) {
+                self.own_imm_resources.dma.wait_for_drain().await;
+                return Ok(());
+            }
+            if !self.atomic_mut_kicked.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            self.process_tx().await?;
+            self.process_rx().await?;
+            self.process_event().await?;
+        }
     }
 }
 

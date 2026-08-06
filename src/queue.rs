@@ -47,7 +47,6 @@ impl QueueLayout {
 pub struct QueueState {
     mut_last_available: u16,
     mut_next_used: u16,
-    mut_inflight: bool,
 }
 
 impl QueueState {
@@ -55,12 +54,7 @@ impl QueueState {
         Self {
             mut_last_available: 0,
             mut_next_used: 0,
-            mut_inflight: false,
         }
-    }
-
-    pub const fn inflight(self) -> bool {
-        self.mut_inflight
     }
 }
 
@@ -104,9 +98,6 @@ impl VirtQueue {
         memory: &DmaMemory,
         state: &mut QueueState,
     ) -> Result<Option<DescriptorChain>, DeviceError> {
-        if state.mut_inflight {
-            return Ok(None);
-        }
         let available_index = read_u16(memory, self.imm_layout.available.gpa + 2)?;
         if available_index == state.mut_last_available {
             return Ok(None);
@@ -124,7 +115,6 @@ impl VirtQueue {
         )?;
         let chain = unsafe { self.read_chain(memory, head)? };
         state.mut_last_available = state.mut_last_available.wrapping_add(1);
-        state.mut_inflight = true;
         Ok(Some(chain))
     }
 
@@ -135,12 +125,6 @@ impl VirtQueue {
         chain: &DescriptorChain,
         used_length: u32,
     ) -> Result<(), DeviceError> {
-        if !state.mut_inflight {
-            return Err(DeviceError::InvalidQueue {
-                queue: self.imm_layout.index,
-                reason: "completion without an inflight request",
-            });
-        }
         let slot = usize::from(state.mut_next_used % self.imm_layout.size);
         let offset = self.imm_layout.used.gpa
             + VIRTQ_USED_HEADER_SIZE as u64
@@ -154,7 +138,6 @@ impl VirtQueue {
             self.imm_layout.used.gpa + 2,
             &state.mut_next_used.to_le_bytes(),
         )?;
-        state.mut_inflight = false;
         Ok(())
     }
 
@@ -287,11 +270,9 @@ mod tests {
 
         let chain = queue.pop(&dma, &mut state).expect("pop").expect("chain");
         assert_eq!(chain.head, 0);
-        assert!(state.inflight());
         queue
             .complete(&dma, &mut state, &chain, 513)
             .expect("complete");
-        assert!(!state.inflight());
         let used = dma.lease(DmaRange::new(0x10a0, 12)).expect("used ring");
         let bytes = unsafe { used.parts()[0].read_slice() };
         assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().expect("idx")), 1);
@@ -299,6 +280,49 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(bytes[8..12].try_into().expect("length")),
             513
+        );
+    }
+
+    #[test]
+    fn accepts_multiple_available_chains_before_completion() {
+        let mut memory = [0u8; 512];
+        for (index, address) in [0x1100u64, 0x1200].into_iter().enumerate() {
+            let offset = index * 16;
+            memory[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
+            memory[offset + 8..offset + 12].copy_from_slice(&512u32.to_le_bytes());
+        }
+        memory[0x82..0x84].copy_from_slice(&2u16.to_le_bytes());
+        memory[0x84..0x86].copy_from_slice(&0u16.to_le_bytes());
+        memory[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        let (dma, queue) = queue(&mut memory);
+        let mut state = QueueState::new();
+
+        let first = queue
+            .pop(&dma, &mut state)
+            .expect("first pop")
+            .expect("first chain");
+        let second = queue
+            .pop(&dma, &mut state)
+            .expect("second pop")
+            .expect("second chain");
+        assert_eq!(first.head, 0);
+        assert_eq!(second.head, 1);
+        queue
+            .complete(&dma, &mut state, &second, 512)
+            .expect("second completion");
+        queue
+            .complete(&dma, &mut state, &first, 512)
+            .expect("first completion");
+        let used = dma.lease(DmaRange::new(0x10a0, 20)).expect("used ring");
+        let bytes = unsafe { used.parts()[0].read_slice() };
+        assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().expect("idx")), 2);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().expect("first head")),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().expect("second head")),
+            0
         );
     }
 }

@@ -56,14 +56,19 @@ pub trait DeviceDeclaration: Send + Sync {
     async fn activate(
         &self,
         resources: DeviceResources,
-    ) -> Result<Box<dyn DeviceInstance>, DeviceError>;
+    ) -> Result<Arc<dyn DeviceInstance>, DeviceError>;
 }
 
 #[async_trait]
 pub trait DeviceInstance: Send + Sync {
     fn kick(&self);
 
-    async fn process_kick(&self) -> Result<(), DeviceError>;
+    fn stop(&self, reason: DeviceDownReason);
 
-    async fn shutdown(&self, reason: DeviceDownReason) -> Result<(), DeviceError>;
+    /// Runs until `stop()` has revoked this device's DMA generation.
+    ///
+    /// The transport owns the task which polls this future. `kick()` is
+    /// deliberately non-blocking so a transport can continue to receive
+    /// power, reset, and removal messages while I/O is in flight.
+    async fn run(&self) -> Result<(), DeviceError>;
 }
