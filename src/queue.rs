@@ -98,13 +98,17 @@ impl VirtQueue {
         memory: &DmaMemory,
         index: u16,
     ) -> Result<Descriptor, DeviceError> {
-        let offset = self
+        let gpa = self
             .imm_layout
             .descriptors
-            .offset
-            .checked_add(usize::from(index) * VIRTQ_DESC_SIZE)
-            .ok_or(DeviceError::Descriptor("descriptor offset overflow"))?;
-        let bytes = unsafe { memory.read_slice(DmaRange::new(offset, VIRTQ_DESC_SIZE))? };
+            .gpa
+            .checked_add(
+                u64::try_from(usize::from(index) * VIRTQ_DESC_SIZE)
+                    .expect("descriptor offset fits u64"),
+            )
+            .ok_or(DeviceError::Descriptor("descriptor GPA overflow"))?;
+        let lease = memory.lease(DmaRange::new(gpa, VIRTQ_DESC_SIZE))?;
+        let bytes = unsafe { lease.parts()[0].read_slice() };
         Ok(Descriptor {
             address: u64::from_le_bytes(bytes[0..8].try_into().expect("descriptor address")),
             length: u32::from_le_bytes(bytes[8..12].try_into().expect("descriptor length")),
@@ -119,16 +123,20 @@ mod tests {
     use std::ptr::NonNull;
 
     use super::{QueueLayout, VirtQueue};
-    use crate::dma::{DmaMemory, DmaRange};
+    use crate::dma::{DmaMemory, DmaRange, DmaSegment};
 
     fn queue(memory: &mut [u8]) -> (DmaMemory, VirtQueue) {
-        let dma = unsafe { DmaMemory::new(NonNull::from(&mut memory[0]), memory.len(), 1) };
+        let dma = DmaMemory::new(
+            1,
+            vec![unsafe { DmaSegment::new(0x1000, NonNull::from(&mut memory[0]), memory.len()) }],
+        )
+        .expect("DMA memory");
         let layout = QueueLayout {
             index: 0,
             size: 8,
-            descriptors: DmaRange::new(0, 8 * 16),
-            available: DmaRange::new(128, 8),
-            used: DmaRange::new(136, 8),
+            descriptors: DmaRange::new(0x1000, 8 * 16),
+            available: DmaRange::new(0x1080, 8),
+            used: DmaRange::new(0x1088, 8),
         };
         let queue = VirtQueue::new(layout, &dma).expect("valid queue");
         (dma, queue)

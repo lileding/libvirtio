@@ -21,12 +21,8 @@ pub enum DeviceError {
     #[error("invalid queue {queue}: {reason}")]
     InvalidQueue { queue: u16, reason: &'static str },
 
-    #[error("DMA range offset={offset} length={length} exceeds {memory_length}")]
-    DmaRange {
-        offset: usize,
-        length: usize,
-        memory_length: usize,
-    },
+    #[error("DMA GPA range {gpa:#x} length={length} is not mapped")]
+    DmaRange { gpa: u64, length: usize },
 
     #[error("DMA mapping is not aligned to {alignment} bytes")]
     DmaAlignment { alignment: usize },

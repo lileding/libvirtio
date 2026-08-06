@@ -12,7 +12,7 @@ pub mod queue;
 
 pub use block::{BlockDeclaration, BlockDevice};
 pub use device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
-pub use dma::{DmaMemory, DmaRange};
+pub use dma::{DmaLease, DmaMemory, DmaPart, DmaRange, DmaSegment};
 pub use error::{DeviceDownReason, DeviceError};
 pub use interrupt::{Interrupt, InterruptNotifier};
 pub use queue::{QueueLayout, VirtQueue};

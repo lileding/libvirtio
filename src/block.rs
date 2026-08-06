@@ -157,7 +157,7 @@ mod tests {
 
     use super::{BlockDeclaration, BlockDevice};
     use crate::device::{DeviceInstance, DeviceResources};
-    use crate::dma::{DmaMemory, DmaRange};
+    use crate::dma::{DmaMemory, DmaRange, DmaSegment};
     use crate::error::{DeviceDownReason, DeviceError};
     use crate::interrupt::{Interrupt, InterruptNotifier};
     use crate::queue::QueueLayout;
@@ -184,11 +184,17 @@ mod tests {
             queues: vec![QueueLayout {
                 index: 0,
                 size: 8,
-                descriptors: DmaRange::new(0, 8 * 16),
-                available: DmaRange::new(128, 8),
-                used: DmaRange::new(136, 8),
+                descriptors: DmaRange::new(0x1000, 8 * 16),
+                available: DmaRange::new(0x1080, 8),
+                used: DmaRange::new(0x1088, 8),
             }],
-            dma: unsafe { DmaMemory::new(NonNull::from(&mut memory[0]), memory.len(), 1) },
+            dma: DmaMemory::new(
+                1,
+                vec![unsafe {
+                    DmaSegment::new(0x1000, NonNull::from(&mut memory[0]), memory.len())
+                }],
+            )
+            .expect("DMA memory"),
             interrupts: vec![Arc::new(TestNotifier)],
             negotiated_features: super::VIRTIO_BLK_F_FLUSH,
         }
