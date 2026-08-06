@@ -244,6 +244,11 @@ pub struct DmaPart {
     imm_length: usize,
 }
 
+// A DmaLease pins the mapping generation until every part is dropped.  Moving
+// a lease to a bounded blocking worker is therefore valid; concurrent access
+// remains the transport and descriptor-direction responsibility.
+unsafe impl Send for DmaPart {}
+
 impl DmaPart {
     pub const fn gpa(&self) -> u64 {
         self.imm_gpa
@@ -251,6 +256,14 @@ impl DmaPart {
 
     pub const fn length(&self) -> usize {
         self.imm_length
+    }
+
+    /// # Safety
+    ///
+    /// The pointer is valid only while the parent lease is alive.  The caller
+    /// must apply the descriptor's direction and transport synchronization.
+    pub unsafe fn as_ptr(&self) -> *mut u8 {
+        self.raw_imm_base.as_ptr()
     }
 
     /// # Safety

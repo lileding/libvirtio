@@ -7,5 +7,6 @@ description = "Reusable asynchronous virtio device implementations"
 
 [dependencies]
 async-trait = "0.1"
+libc = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync"] }

@@ -32,4 +32,7 @@ pub enum DeviceError {
 
     #[error("I/O failed: {0}")]
     Io(#[from] io::Error),
+
+    #[error("blocking device worker failed: {0}")]
+    Worker(String),
 }
