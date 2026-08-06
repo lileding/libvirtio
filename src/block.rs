@@ -483,6 +483,8 @@ impl DeviceInstance for BlockDevice {
 
     async fn shutdown(&self, _reason: DeviceDownReason) -> Result<(), DeviceError> {
         self.atomic_mut_down.store(true, Ordering::Release);
+        self.own_imm_resources.dma.revoke();
+        self.own_imm_resources.dma.wait_for_drain().await;
         Ok(())
     }
 }
