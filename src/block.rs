@@ -12,6 +12,7 @@ use crate::error::{DeviceDownReason, DeviceError};
 use crate::queue::{DescriptorChain, QueueState, VirtQueue};
 
 pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
 pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
@@ -440,7 +441,7 @@ impl DeviceDeclaration for BlockDeclaration {
             queue_count: self.imm_queue_count,
             maximum_queue_size: self.imm_maximum_queue_size,
             notifier_count: self.imm_queue_count,
-            required_features: VIRTIO_BLK_F_FLUSH,
+            required_features: VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH,
             optional_features: 0,
         }
     }
@@ -497,9 +498,9 @@ mod tests {
 
     use super::{
         BlockDeclaration, BlockDevice, BlockRequestType, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_S_OK,
-        VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_OUT,
+        VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_OUT, VIRTIO_F_VERSION_1,
     };
-    use crate::device::{DeviceInstance, DeviceResources};
+    use crate::device::{DeviceDeclaration, DeviceInstance, DeviceResources};
     use crate::dma::{DmaMemory, DmaRange, DmaSegment};
     use crate::error::{DeviceDownReason, DeviceError};
     use crate::interrupt::{Interrupt, InterruptNotifier};
@@ -550,8 +551,20 @@ mod tests {
             )
             .expect("DMA memory"),
             interrupts: vec![notifier],
-            negotiated_features: VIRTIO_BLK_F_FLUSH,
+            negotiated_features: VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH,
         }
+    }
+
+    #[test]
+    fn modern_block_requires_version_one() {
+        let path = image_path();
+        fs::write(&path, vec![0u8; 512]).expect("create image");
+        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
+        assert_eq!(
+            declaration.layout().required_features,
+            VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH
+        );
+        fs::remove_file(path).expect("remove image");
     }
 
     #[tokio::test]
