@@ -15,4 +15,4 @@ pub use device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResource
 pub use dma::{DmaLease, DmaMemory, DmaPart, DmaRange, DmaSegment};
 pub use error::{DeviceDownReason, DeviceError};
 pub use interrupt::{Interrupt, InterruptNotifier};
-pub use queue::{QueueLayout, VirtQueue};
+pub use queue::{QueueLayout, QueueState, VirtQueue};

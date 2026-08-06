@@ -63,5 +63,7 @@ pub trait DeviceDeclaration: Send + Sync {
 pub trait DeviceInstance: Send + Sync {
     fn kick(&self);
 
+    async fn process_kick(&self) -> Result<(), DeviceError>;
+
     async fn shutdown(&self, reason: DeviceDownReason) -> Result<(), DeviceError>;
 }

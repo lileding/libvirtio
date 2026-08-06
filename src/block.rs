@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
 use crate::dma::{DmaLease, DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
-use crate::queue::DescriptorChain;
+use crate::queue::{DescriptorChain, QueueState, VirtQueue};
 
 pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 pub const VIRTIO_BLK_T_IN: u32 = 0;
@@ -76,6 +77,7 @@ pub struct BlockDevice {
     own_imm_resources: DeviceResources,
     imm_read_only: bool,
     imm_capacity: u64,
+    own_mut_queue_states: Mutex<Vec<QueueState>>,
     atomic_mut_kicked: AtomicBool,
     atomic_mut_down: AtomicBool,
 }
@@ -95,11 +97,13 @@ impl BlockDevice {
                 "block image must have a non-zero sector-aligned size",
             ));
         }
+        let queue_count = resources.queues.len();
         Ok(Self {
             own_imm_file: file,
             own_imm_resources: resources,
             imm_read_only: declaration.imm_read_only,
             imm_capacity: capacity,
+            own_mut_queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
             atomic_mut_kicked: AtomicBool::new(false),
             atomic_mut_down: AtomicBool::new(false),
         })
@@ -211,6 +215,45 @@ impl BlockDevice {
             return Err(DeviceError::Down(DeviceDownReason::Revoked));
         }
         Ok(())
+    }
+
+    async fn process_queue(&self, queue_index: usize) -> Result<bool, DeviceError> {
+        let queue_layout = *self
+            .own_imm_resources
+            .queues
+            .get(queue_index)
+            .ok_or(DeviceError::InvalidLayout("queue index is not configured"))?;
+        let queue = VirtQueue::new(queue_layout, &self.own_imm_resources.dma)?;
+        let chain = {
+            let mut states = self.own_mut_queue_states.lock().await;
+            queue.pop(&self.own_imm_resources.dma, &mut states[queue_index])?
+        };
+        let Some(chain) = chain else {
+            return Ok(false);
+        };
+        let request = Self::parse_request(&self.own_imm_resources.dma, &chain)?;
+        let completion = self.execute(&self.own_imm_resources.dma, request).await?;
+        {
+            let mut states = self.own_mut_queue_states.lock().await;
+            queue.complete(
+                &self.own_imm_resources.dma,
+                &mut states[queue_index],
+                &chain,
+                completion.used_length,
+            )?;
+        }
+        let notifier = self.own_imm_resources.interrupts.get(queue_index).ok_or(
+            DeviceError::InvalidLayout("missing queue interrupt notifier"),
+        )?;
+        notifier
+            .notify(crate::interrupt::Interrupt::Queue {
+                queue_index: u16::try_from(queue_index)
+                    .map_err(|_| DeviceError::InvalidLayout("queue index exceeds u16"))?,
+                vector: u16::try_from(queue_index)
+                    .map_err(|_| DeviceError::InvalidLayout("vector exceeds u16"))?,
+            })
+            .await?;
+        Ok(true)
     }
 }
 
@@ -381,6 +424,21 @@ impl DeviceInstance for BlockDevice {
         self.atomic_mut_kicked.store(true, Ordering::Release);
     }
 
+    async fn process_kick(&self) -> Result<(), DeviceError> {
+        if !self.take_kick() {
+            return Ok(());
+        }
+        loop {
+            let mut did_work = false;
+            for queue_index in 0..self.own_imm_resources.queues.len() {
+                did_work |= self.process_queue(queue_index).await?;
+            }
+            if !did_work {
+                return Ok(());
+            }
+        }
+    }
+
     async fn shutdown(&self, _reason: DeviceDownReason) -> Result<(), DeviceError> {
         self.atomic_mut_down.store(true, Ordering::Release);
         self.own_imm_resources.dma.revoke();
@@ -395,6 +453,7 @@ mod tests {
     use std::path::PathBuf;
     use std::ptr::NonNull;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -406,11 +465,22 @@ mod tests {
     use crate::interrupt::{Interrupt, InterruptNotifier};
     use crate::queue::{QueueLayout, VirtQueue};
 
-    struct TestNotifier;
+    #[derive(Default)]
+    struct TestNotifier {
+        atomic_mut_count: AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl InterruptNotifier for TestNotifier {
-        async fn notify(&self, _interrupt: Interrupt) -> Result<(), DeviceError> {
+        async fn notify(&self, interrupt: Interrupt) -> Result<(), DeviceError> {
+            assert_eq!(
+                interrupt,
+                Interrupt::Queue {
+                    queue_index: 0,
+                    vector: 0
+                }
+            );
+            self.atomic_mut_count.fetch_add(1, Ordering::Release);
             Ok(())
         }
     }
@@ -423,14 +493,14 @@ mod tests {
         std::env::temp_dir().join(format!("libvirtiod-block-{unique}.raw"))
     }
 
-    fn resources(memory: &mut [u8]) -> DeviceResources {
+    fn resources(memory: &mut [u8], notifier: Arc<dyn InterruptNotifier>) -> DeviceResources {
         DeviceResources {
             queues: vec![QueueLayout {
                 index: 0,
                 size: 8,
                 descriptors: DmaRange::new(0x1000, 8 * 16),
-                available: DmaRange::new(0x1080, 8),
-                used: DmaRange::new(0x1088, 8),
+                available: DmaRange::new(0x1080, 4 + 8 * 2),
+                used: DmaRange::new(0x10a0, 4 + 8 * 8),
             }],
             dma: DmaMemory::new(
                 1,
@@ -439,7 +509,7 @@ mod tests {
                 }],
             )
             .expect("DMA memory"),
-            interrupts: vec![Arc::new(TestNotifier)],
+            interrupts: vec![notifier],
             negotiated_features: VIRTIO_BLK_F_FLUSH,
         }
     }
@@ -467,7 +537,11 @@ mod tests {
         memory[0x208..0x210].copy_from_slice(&(1u64).to_le_bytes());
 
         let declaration = BlockDeclaration::new(&path, 1, 128);
-        let device = BlockDevice::open(&declaration, resources(&mut memory)).expect("open image");
+        let device = BlockDevice::open(
+            &declaration,
+            resources(&mut memory, Arc::new(TestNotifier::default())),
+        )
+        .expect("open image");
         let queue =
             VirtQueue::new(device.resources().queues[0], &device.resources().dma).expect("queue");
         let chain = unsafe { queue.read_chain(&device.resources().dma, 0) }.expect("chain");
@@ -497,6 +571,81 @@ mod tests {
         );
         drop(status);
         drop(payload);
+        device
+            .shutdown(DeviceDownReason::Stop)
+            .await
+            .expect("shutdown");
+        fs::remove_file(path).expect("remove image");
+    }
+
+    #[tokio::test]
+    async fn processes_avail_ring_and_notifies_completion() {
+        let path = image_path();
+        let mut image = vec![0u8; 4096];
+        image[512..516].copy_from_slice(b"vmm\n");
+        fs::write(&path, image).expect("create image");
+
+        let mut memory = [0u8; 4096];
+        memory[0..8].copy_from_slice(&0x1200u64.to_le_bytes());
+        memory[8..12].copy_from_slice(&(16u32).to_le_bytes());
+        memory[12..14].copy_from_slice(&(1u16).to_le_bytes());
+        memory[14..16].copy_from_slice(&(1u16).to_le_bytes());
+        memory[16..24].copy_from_slice(&0x1300u64.to_le_bytes());
+        memory[24..28].copy_from_slice(&(4u32).to_le_bytes());
+        memory[28..30].copy_from_slice(&(3u16).to_le_bytes());
+        memory[30..32].copy_from_slice(&(2u16).to_le_bytes());
+        memory[32..40].copy_from_slice(&0x1400u64.to_le_bytes());
+        memory[40..44].copy_from_slice(&(1u32).to_le_bytes());
+        memory[44..46].copy_from_slice(&(2u16).to_le_bytes());
+        memory[0x200..0x204].copy_from_slice(&(0u32).to_le_bytes());
+        memory[0x208..0x210].copy_from_slice(&(1u64).to_le_bytes());
+        memory[0x82..0x84].copy_from_slice(&1u16.to_le_bytes());
+        memory[0x84..0x86].copy_from_slice(&0u16.to_le_bytes());
+
+        let notifier = Arc::new(TestNotifier::default());
+        let declaration = BlockDeclaration::new(&path, 1, 128);
+        let device = BlockDevice::open(&declaration, resources(&mut memory, notifier.clone()))
+            .expect("open image");
+        device.kick();
+        device.process_kick().await.expect("process kick");
+
+        let used = device
+            .resources()
+            .dma
+            .lease(DmaRange::new(0x10a0, 12))
+            .expect("used ring");
+        let bytes = unsafe { used.parts()[0].read_slice() };
+        assert_eq!(
+            u16::from_le_bytes(bytes[2..4].try_into().expect("used index")),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().expect("used head")),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().expect("used length")),
+            5
+        );
+        drop(used);
+        let payload = device
+            .resources()
+            .dma
+            .lease(DmaRange::new(0x1300, 4))
+            .expect("payload");
+        assert_eq!(unsafe { payload.parts()[0].read_slice() }, b"vmm\n");
+        drop(payload);
+        let status = device
+            .resources()
+            .dma
+            .lease(DmaRange::new(0x1400, 1))
+            .expect("status");
+        assert_eq!(
+            unsafe { status.parts()[0].read_slice() },
+            &[VIRTIO_BLK_S_OK]
+        );
+        drop(status);
+        assert_eq!(notifier.atomic_mut_count.load(Ordering::Acquire), 1);
         device
             .shutdown(DeviceDownReason::Stop)
             .await
