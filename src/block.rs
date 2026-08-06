@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use tokio::sync::Mutex;
 
 use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
@@ -429,9 +430,14 @@ impl DeviceInstance for BlockDevice {
             return Ok(());
         }
         loop {
+            let results = join_all(
+                (0..self.own_imm_resources.queues.len())
+                    .map(|queue_index| self.process_queue(queue_index)),
+            )
+            .await;
             let mut did_work = false;
-            for queue_index in 0..self.own_imm_resources.queues.len() {
-                did_work |= self.process_queue(queue_index).await?;
+            for result in results {
+                did_work |= result?;
             }
             if !did_work {
                 return Ok(());
@@ -458,6 +464,7 @@ mod tests {
 
     use super::{
         BlockDeclaration, BlockDevice, BlockRequestType, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_S_OK,
+        VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_OUT,
     };
     use crate::device::{DeviceInstance, DeviceResources};
     use crate::dma::{DmaMemory, DmaRange, DmaSegment};
@@ -646,6 +653,71 @@ mod tests {
         );
         drop(status);
         assert_eq!(notifier.atomic_mut_count.load(Ordering::Acquire), 1);
+        device
+            .shutdown(DeviceDownReason::Stop)
+            .await
+            .expect("shutdown");
+        fs::remove_file(path).expect("remove image");
+    }
+
+    #[tokio::test]
+    async fn executes_write_and_flush_requests() {
+        let path = image_path();
+        fs::write(&path, vec![0u8; 4096]).expect("create image");
+
+        let mut memory = [0u8; 4096];
+        memory[0..8].copy_from_slice(&0x1200u64.to_le_bytes());
+        memory[8..12].copy_from_slice(&(16u32).to_le_bytes());
+        memory[12..14].copy_from_slice(&(1u16).to_le_bytes());
+        memory[14..16].copy_from_slice(&(1u16).to_le_bytes());
+        memory[16..24].copy_from_slice(&0x1300u64.to_le_bytes());
+        memory[24..28].copy_from_slice(&(4u32).to_le_bytes());
+        memory[28..30].copy_from_slice(&(1u16).to_le_bytes());
+        memory[30..32].copy_from_slice(&(2u16).to_le_bytes());
+        memory[32..40].copy_from_slice(&0x1400u64.to_le_bytes());
+        memory[40..44].copy_from_slice(&(1u32).to_le_bytes());
+        memory[44..46].copy_from_slice(&(2u16).to_le_bytes());
+        memory[0x200..0x204].copy_from_slice(&VIRTIO_BLK_T_OUT.to_le_bytes());
+        memory[0x208..0x210].copy_from_slice(&(2u64).to_le_bytes());
+        memory[0x300..0x304].copy_from_slice(b"out\n");
+
+        let declaration = BlockDeclaration::new(&path, 1, 128);
+        let device = BlockDevice::open(
+            &declaration,
+            resources(&mut memory, Arc::new(TestNotifier::default())),
+        )
+        .expect("open image");
+        let queue =
+            VirtQueue::new(device.resources().queues[0], &device.resources().dma).expect("queue");
+        let chain = unsafe { queue.read_chain(&device.resources().dma, 0) }.expect("write chain");
+        let request =
+            BlockDevice::parse_request(&device.resources().dma, &chain).expect("write request");
+        assert_eq!(request.request_type, BlockRequestType::Out);
+        let completion = device
+            .execute(&device.resources().dma, request)
+            .await
+            .expect("write execute");
+        assert_eq!(completion.status, VIRTIO_BLK_S_OK);
+        assert_eq!(fs::read(&path).expect("read image")[1024..1028], *b"out\n");
+
+        memory[0..8].copy_from_slice(&0x1500u64.to_le_bytes());
+        memory[8..12].copy_from_slice(&(16u32).to_le_bytes());
+        memory[12..14].copy_from_slice(&(1u16).to_le_bytes());
+        memory[14..16].copy_from_slice(&(1u16).to_le_bytes());
+        memory[16..24].copy_from_slice(&0x1600u64.to_le_bytes());
+        memory[24..28].copy_from_slice(&(1u32).to_le_bytes());
+        memory[28..30].copy_from_slice(&(2u16).to_le_bytes());
+        memory[0x500..0x504].copy_from_slice(&VIRTIO_BLK_T_FLUSH.to_le_bytes());
+        memory[0x508..0x510].copy_from_slice(&(0u64).to_le_bytes());
+        let chain = unsafe { queue.read_chain(&device.resources().dma, 0) }.expect("flush chain");
+        let request =
+            BlockDevice::parse_request(&device.resources().dma, &chain).expect("flush request");
+        assert_eq!(request.request_type, BlockRequestType::Flush);
+        let completion = device
+            .execute(&device.resources().dma, request)
+            .await
+            .expect("flush execute");
+        assert_eq!(completion.status, VIRTIO_BLK_S_OK);
         device
             .shutdown(DeviceDownReason::Stop)
             .await
