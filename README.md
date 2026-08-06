@@ -18,9 +18,10 @@ The embedding monitor follows this sequence:
 2. Construct a device declaration and inspect `DeviceDeclaration::layout()`.
 3. Negotiate the declared virtio features with the guest transport.
 4. Call `activate()` with `DeviceResources` to obtain a `DeviceInstance`.
-5. Call `kick()` when the transport reports a guest doorbell, then schedule
-   `process_kick()` in the monitor's own async reactor.
-6. Call `shutdown()` on transport power-off, disconnect, or teardown.
+5. Call `kick()` when the transport reports a guest doorbell. The monitor owns
+   the task that awaits `DeviceInstance::run()`.
+6. Call `stop()` on transport power-off, disconnect, or teardown, then await
+   `run()` before reclaiming the DMA mapping.
 
 `DeviceResources` carries a revocable DMA mapping, queue layouts, negotiated
 features, and interrupt notifiers.  Device implementations never assume a
@@ -31,11 +32,12 @@ specific file-descriptor, kqueue, PCI, MMIO, or hypervisor ABI.
 | Device | Current scope |
 | --- | --- |
 | `BlockDeclaration` | Raw sector-aligned regular-file virtio-blk; read, write, and flush; asynchronous blocking-file work through Tokio. |
-| `NetDeclaration` | TAP-backed virtio-net; one RX/TX queue pair, MAC address, and link-up status. |
-| `VsockDeclaration` | Virtio-vsock stream transport used by Kata agent control and host-initiated streams. |
+| `NetDeclaration` | TAP-backed virtio-net; up to four RX/TX queue pairs, control queue, MAC address, and link-up status. No checksum or GSO offload is advertised. |
+| `VsockDeclaration` | Modern virtio-vsock STREAM and SEQPACKET transport, packet validation, negotiated type enforcement, and revocable lifecycle hooks. |
+| `RngDeclaration` | Modern virtio-rng filled by the platform `arc4random_buf` entropy API on targets where Rust libc declares it. |
 
-The following are deliberately not claimed yet: multiqueue net, control
-queue/offloads, complete vsock socket semantics, virtio-fs, and virtio-rng.
+The following are deliberately not claimed yet: full virtio-net offloads,
+guest-initiated vsock listeners, SOCK_DGRAM, and virtio-fs.
 
 ## Build
 

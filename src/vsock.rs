@@ -11,8 +11,11 @@ use crate::interrupt::Interrupt;
 use crate::queue::{DescriptorChain, QueueState, VirtQueue};
 
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+pub const VIRTIO_VSOCK_F_STREAM: u64 = 1 << 0;
+pub const VIRTIO_VSOCK_F_SEQPACKET: u64 = 1 << 1;
 pub const VSOCK_HOST_CID: u64 = 2;
 pub const VSOCK_TYPE_STREAM: u16 = 1;
+pub const VSOCK_TYPE_SEQPACKET: u16 = 2;
 pub const VSOCK_OP_REQUEST: u16 = 1;
 pub const VSOCK_OP_RESPONSE: u16 = 2;
 pub const VSOCK_OP_RST: u16 = 3;
@@ -88,10 +91,12 @@ pub struct VsockPacket {
 
 impl VsockPacket {
     pub fn validate(&self) -> Result<(), DeviceError> {
-        if self.header.packet_type != VSOCK_TYPE_STREAM
-            || usize::try_from(self.header.length)
-                .map_err(|_| DeviceError::Descriptor("vsock length overflows usize"))?
-                != self.payload.len()
+        if !matches!(
+            self.header.packet_type,
+            VSOCK_TYPE_STREAM | VSOCK_TYPE_SEQPACKET
+        ) || usize::try_from(self.header.length)
+            .map_err(|_| DeviceError::Descriptor("vsock length overflows usize"))?
+            != self.payload.len()
             || self.payload.len() > MAXIMUM_PACKET_SIZE
         {
             return Err(DeviceError::Descriptor("invalid virtio-vsock packet"));
@@ -105,6 +110,7 @@ pub trait VsockBackend: Send + Sync {
     async fn receive_packet(&self, packet: VsockPacket) -> Result<(), DeviceError>;
     fn has_packet(&self) -> bool;
     fn take_packet(&self) -> Option<VsockPacket>;
+    fn shutdown(&self);
 }
 
 pub struct VsockDeclaration {
@@ -146,6 +152,8 @@ struct VsockDevice {
     own_imm_wake: Notify,
     atomic_mut_kicked: AtomicBool,
     atomic_mut_down: AtomicBool,
+    imm_stream_supported: bool,
+    imm_seqpacket_supported: bool,
 }
 
 #[async_trait]
@@ -156,7 +164,7 @@ impl DeviceDeclaration for VsockDeclaration {
             maximum_queue_size: self.imm_maximum_queue_size,
             notifier_count: QUEUE_COUNT + 1,
             required_features: VIRTIO_F_VERSION_1,
-            optional_features: 0,
+            optional_features: VIRTIO_VSOCK_F_STREAM | VIRTIO_VSOCK_F_SEQPACKET,
         }
     }
 
@@ -165,6 +173,9 @@ impl DeviceDeclaration for VsockDeclaration {
         resources: DeviceResources,
     ) -> Result<Arc<dyn DeviceInstance>, DeviceError> {
         resources.validate(&self.layout())?;
+        let stream_supported = resources.negotiated_features & VIRTIO_VSOCK_F_STREAM != 0
+            || resources.negotiated_features & VIRTIO_VSOCK_F_SEQPACKET == 0;
+        let seqpacket_supported = resources.negotiated_features & VIRTIO_VSOCK_F_SEQPACKET != 0;
         Ok(Arc::new(VsockDevice {
             own_mut_queue_states: Mutex::new(vec![QueueState::new(); QUEUE_COUNT]),
             own_imm_wake: Notify::new(),
@@ -172,6 +183,8 @@ impl DeviceDeclaration for VsockDeclaration {
             own_imm_backend: Arc::clone(&self.own_imm_backend),
             atomic_mut_kicked: AtomicBool::new(false),
             atomic_mut_down: AtomicBool::new(false),
+            imm_stream_supported: stream_supported,
+            imm_seqpacket_supported: seqpacket_supported,
         }))
     }
 }
@@ -185,6 +198,7 @@ impl DeviceInstance for VsockDevice {
 
     fn stop(&self, _reason: DeviceDownReason) {
         self.atomic_mut_down.store(true, Ordering::Release);
+        self.own_imm_backend.shutdown();
         self.own_imm_resources.dma.revoke();
         self.own_imm_wake.notify_waiters();
     }
@@ -212,6 +226,21 @@ impl DeviceInstance for VsockDevice {
 }
 
 impl VsockDevice {
+    fn validate_packet_type(&self, packet: &VsockPacket) -> Result<(), DeviceError> {
+        let supported = match packet.header.packet_type {
+            VSOCK_TYPE_STREAM => self.imm_stream_supported,
+            VSOCK_TYPE_SEQPACKET => self.imm_seqpacket_supported,
+            _ => false,
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(DeviceError::Descriptor(
+                "virtio-vsock packet type was not negotiated",
+            ))
+        }
+    }
+
     async fn process_tx(&self) -> Result<(), DeviceError> {
         loop {
             let chain = {
@@ -227,6 +256,7 @@ impl VsockDevice {
                 chain
             };
             let packet = read_packet(&self.own_imm_resources.dma, &chain)?;
+            self.validate_packet_type(&packet)?;
             let used_length = packet.header.length.saturating_add(HEADER_SIZE as u32);
             self.own_imm_backend.receive_packet(packet).await?;
             let mut states = self.own_mut_queue_states.lock().await;
@@ -262,6 +292,7 @@ impl VsockDevice {
                 .own_imm_backend
                 .take_packet()
                 .ok_or(DeviceError::Descriptor("vsock packet disappeared"))?;
+            self.validate_packet_type(&packet)?;
             let bytes = packet_bytes(&packet)?;
             write_packet(&self.own_imm_resources.dma, &chain, &bytes)?;
             queue.complete(
@@ -400,7 +431,9 @@ fn write_packet(
 
 #[cfg(test)]
 mod tests {
-    use super::{VSOCK_OP_REQUEST, VSOCK_TYPE_STREAM, VsockHeader, VsockPacket};
+    use super::{
+        VSOCK_OP_REQUEST, VSOCK_TYPE_SEQPACKET, VSOCK_TYPE_STREAM, VsockHeader, VsockPacket,
+    };
     #[test]
     fn header_round_trip_preserves_stream_packet() {
         let header = VsockHeader {
@@ -425,5 +458,27 @@ mod tests {
         }
         .validate()
         .expect("packet");
+    }
+
+    #[test]
+    fn seqpacket_packet_is_valid() {
+        let header = VsockHeader {
+            source_cid: 3,
+            destination_cid: 2,
+            source_port: 1024,
+            destination_port: 1025,
+            length: 3,
+            packet_type: VSOCK_TYPE_SEQPACKET,
+            operation: VSOCK_OP_REQUEST,
+            flags: 0,
+            buffer_allocation: 65536,
+            forward_count: 0,
+        };
+        VsockPacket {
+            header,
+            payload: b"abc".to_vec(),
+        }
+        .validate()
+        .expect("seqpacket");
     }
 }
