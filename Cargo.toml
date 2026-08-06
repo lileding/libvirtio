@@ -1,0 +1,11 @@
+[package]
+name = "libvirtiod"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Reusable asynchronous virtio device implementations"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync"] }
