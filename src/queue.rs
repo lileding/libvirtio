@@ -45,15 +45,15 @@ impl QueueLayout {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueState {
-    mut_last_available: u16,
-    mut_next_used: u16,
+    last_available: u16,
+    next_used: u16,
 }
 
 impl QueueState {
     pub const fn new() -> Self {
         Self {
-            mut_last_available: 0,
-            mut_next_used: 0,
+            last_available: 0,
+            next_used: 0,
         }
     }
 }
@@ -80,17 +80,17 @@ pub struct DescriptorChain {
 
 #[derive(Clone, Copy)]
 pub struct VirtQueue {
-    imm_layout: QueueLayout,
+    layout: QueueLayout,
 }
 
 impl VirtQueue {
     pub fn new(layout: QueueLayout, memory: &DmaMemory) -> Result<Self, DeviceError> {
         layout.validate(memory)?;
-        Ok(Self { imm_layout: layout })
+        Ok(Self { layout })
     }
 
     pub const fn layout(self) -> QueueLayout {
-        self.imm_layout
+        self.layout
     }
 
     pub fn pop(
@@ -98,23 +98,23 @@ impl VirtQueue {
         memory: &DmaMemory,
         state: &mut QueueState,
     ) -> Result<Option<DescriptorChain>, DeviceError> {
-        let available_index = read_u16(memory, self.imm_layout.available.gpa + 2)?;
-        if available_index == state.mut_last_available {
+        let available_index = read_u16(memory, self.layout.available.gpa + 2)?;
+        if available_index == state.last_available {
             return Ok(None);
         }
-        if available_index.wrapping_sub(state.mut_last_available) > self.imm_layout.size {
+        if available_index.wrapping_sub(state.last_available) > self.layout.size {
             return Err(DeviceError::InvalidQueue {
-                queue: self.imm_layout.index,
+                queue: self.layout.index,
                 reason: "available index exceeds queue size",
             });
         }
-        let slot = usize::from(state.mut_last_available % self.imm_layout.size);
+        let slot = usize::from(state.last_available % self.layout.size);
         let head = read_u16(
             memory,
-            self.imm_layout.available.gpa + VIRTQ_AVAIL_HEADER_SIZE as u64 + (slot * 2) as u64,
+            self.layout.available.gpa + VIRTQ_AVAIL_HEADER_SIZE as u64 + (slot * 2) as u64,
         )?;
         let chain = unsafe { self.read_chain(memory, head)? };
-        state.mut_last_available = state.mut_last_available.wrapping_add(1);
+        state.last_available = state.last_available.wrapping_add(1);
         Ok(Some(chain))
     }
 
@@ -125,18 +125,18 @@ impl VirtQueue {
         chain: &DescriptorChain,
         used_length: u32,
     ) -> Result<(), DeviceError> {
-        let slot = usize::from(state.mut_next_used % self.imm_layout.size);
-        let offset = self.imm_layout.used.gpa
+        let slot = usize::from(state.next_used % self.layout.size);
+        let offset = self.layout.used.gpa
             + VIRTQ_USED_HEADER_SIZE as u64
             + (slot * VIRTQ_USED_ELEMENT_SIZE) as u64;
         write_bytes(memory, offset, &u32::from(chain.head).to_le_bytes())?;
         write_bytes(memory, offset + 4, &used_length.to_le_bytes())?;
         fence(Ordering::Release);
-        state.mut_next_used = state.mut_next_used.wrapping_add(1);
+        state.next_used = state.next_used.wrapping_add(1);
         write_bytes(
             memory,
-            self.imm_layout.used.gpa + 2,
-            &state.mut_next_used.to_le_bytes(),
+            self.layout.used.gpa + 2,
+            &state.next_used.to_le_bytes(),
         )?;
         Ok(())
     }
@@ -151,20 +151,20 @@ impl VirtQueue {
         memory: &DmaMemory,
         head: u16,
     ) -> Result<DescriptorChain, DeviceError> {
-        if head >= self.imm_layout.size {
+        if head >= self.layout.size {
             return Err(DeviceError::Descriptor("head index exceeds queue size"));
         }
 
         let mut current = head;
         let mut descriptors = Vec::new();
-        for _ in 0..self.imm_layout.size {
+        for _ in 0..self.layout.size {
             let descriptor = unsafe { self.read_descriptor(memory, current)? };
             let has_next = descriptor.flags & VIRTQ_DESC_F_NEXT != 0;
             descriptors.push(descriptor);
             if !has_next {
                 return Ok(DescriptorChain { head, descriptors });
             }
-            if descriptor.next >= self.imm_layout.size {
+            if descriptor.next >= self.layout.size {
                 return Err(DeviceError::Descriptor("next index exceeds queue size"));
             }
             current = descriptor.next;
@@ -178,7 +178,7 @@ impl VirtQueue {
         index: u16,
     ) -> Result<Descriptor, DeviceError> {
         let gpa = self
-            .imm_layout
+            .layout
             .descriptors
             .gpa
             .checked_add(

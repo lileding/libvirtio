@@ -54,10 +54,10 @@ pub struct FsConfig {
 
 #[derive(Clone, Debug)]
 pub struct FsDeclaration {
-    own_imm_root: PathBuf,
-    imm_tag: [u8; VIRTIO_FS_TAG_SIZE],
-    imm_request_queue_count: usize,
-    imm_maximum_queue_size: u16,
+    root: PathBuf,
+    tag: [u8; VIRTIO_FS_TAG_SIZE],
+    request_queue_count: usize,
+    maximum_queue_size: u16,
 }
 
 impl FsDeclaration {
@@ -84,21 +84,21 @@ impl FsDeclaration {
         let mut tag_bytes = [0u8; VIRTIO_FS_TAG_SIZE];
         tag_bytes[..tag.len()].copy_from_slice(tag.as_bytes());
         Ok(Self {
-            own_imm_root: root,
-            imm_tag: tag_bytes,
-            imm_request_queue_count: request_queue_count,
-            imm_maximum_queue_size: maximum_queue_size,
+            root,
+            tag: tag_bytes,
+            request_queue_count,
+            maximum_queue_size,
         })
     }
 
     pub fn root(&self) -> &Path {
-        &self.own_imm_root
+        &self.root
     }
 
     pub fn config(&self) -> FsConfig {
         FsConfig {
-            tag: self.imm_tag,
-            request_queue_count: u32::try_from(self.imm_request_queue_count)
+            tag: self.tag,
+            request_queue_count: u32::try_from(self.request_queue_count)
                 .expect("validated request queue count"),
         }
     }
@@ -114,144 +114,137 @@ impl FsDeclaration {
 
 #[derive(Clone)]
 struct FsInodes {
-    mut_next: u64,
-    own_by_id: HashMap<u64, PathBuf>,
-    own_by_path: HashMap<PathBuf, u64>,
+    next: u64,
+    by_id: HashMap<u64, PathBuf>,
+    by_path: HashMap<PathBuf, u64>,
 }
 
 impl FsInodes {
     fn new(root: PathBuf) -> Self {
-        let mut own_by_id = HashMap::new();
-        let mut own_by_path = HashMap::new();
-        own_by_id.insert(FUSE_ROOT_ID, root.clone());
-        own_by_path.insert(root, FUSE_ROOT_ID);
+        let mut by_id = HashMap::new();
+        let mut by_path = HashMap::new();
+        by_id.insert(FUSE_ROOT_ID, root.clone());
+        by_path.insert(root, FUSE_ROOT_ID);
         Self {
-            mut_next: FUSE_ROOT_ID + 1,
-            own_by_id,
-            own_by_path,
+            next: FUSE_ROOT_ID + 1,
+            by_id,
+            by_path,
         }
     }
 
     fn id_for_path(&mut self, path: PathBuf) -> Result<u64, DeviceError> {
-        if let Some(id) = self.own_by_path.get(&path) {
+        if let Some(id) = self.by_path.get(&path) {
             return Ok(*id);
         }
-        let id = self.mut_next;
-        self.mut_next = self
-            .mut_next
+        let id = self.next;
+        self.next = self
+            .next
             .checked_add(1)
             .ok_or(DeviceError::InvalidLayout("virtio-fs inode id overflow"))?;
-        self.own_by_id.insert(id, path.clone());
-        self.own_by_path.insert(path, id);
+        self.by_id.insert(id, path.clone());
+        self.by_path.insert(path, id);
         Ok(id)
     }
 }
 
 pub struct FsDevice {
-    own_imm_root: PathBuf,
-    own_imm_resources: DeviceResources,
-    own_mut_queue_states: Mutex<Vec<QueueState>>,
-    arc_imm_inodes: Arc<std::sync::Mutex<FsInodes>>,
-    own_imm_wake: Notify,
-    atomic_mut_down: AtomicBool,
+    root: PathBuf,
+    resources: DeviceResources,
+    queue_states: Mutex<Vec<QueueState>>,
+    inodes: Arc<std::sync::Mutex<FsInodes>>,
+    wake: Notify,
+    down: AtomicBool,
 }
 
 struct FsWork {
-    imm_queue_index: usize,
-    own_imm_chain: DescriptorChain,
-    own_imm_request: Vec<u8>,
-    own_imm_reply: Vec<DmaRange>,
+    queue_index: usize,
+    chain: DescriptorChain,
+    request: Vec<u8>,
+    reply: Vec<DmaRange>,
 }
 
 struct FsCompletion {
-    own_imm_work: FsWork,
-    own_imm_reply: Vec<u8>,
+    work: FsWork,
+    reply: Vec<u8>,
 }
 
 impl FsDevice {
     fn new(declaration: &FsDeclaration, resources: DeviceResources) -> Self {
         Self {
-            own_imm_root: declaration.own_imm_root.clone(),
-            own_mut_queue_states: Mutex::new(vec![QueueState::new(); resources.queues.len()]),
-            arc_imm_inodes: Arc::new(std::sync::Mutex::new(FsInodes::new(
-                declaration.own_imm_root.clone(),
+            root: declaration.root.clone(),
+            queue_states: Mutex::new(vec![QueueState::new(); resources.queues.len()]),
+            inodes: Arc::new(std::sync::Mutex::new(FsInodes::new(
+                declaration.root.clone(),
             ))),
-            own_imm_resources: resources,
-            own_imm_wake: Notify::new(),
-            atomic_mut_down: AtomicBool::new(false),
+            resources,
+            wake: Notify::new(),
+            down: AtomicBool::new(false),
         }
     }
 
     fn check_live(&self) -> Result<(), DeviceError> {
-        if self.atomic_mut_down.load(Ordering::Acquire) {
+        if self.down.load(Ordering::Acquire) {
             return Err(DeviceError::Down(DeviceDownReason::Revoked));
         }
         Ok(())
     }
 
     async fn take_work(&self, queue_index: usize) -> Result<Option<FsWork>, DeviceError> {
-        let queue_layout = self.own_imm_resources.queues[queue_index];
-        let queue = VirtQueue::new(queue_layout, &self.own_imm_resources.dma)?;
+        let queue_layout = self.resources.queues[queue_index];
+        let queue = VirtQueue::new(queue_layout, &self.resources.dma)?;
         let chain = {
-            let mut states = self.own_mut_queue_states.lock().await;
-            queue.pop(&self.own_imm_resources.dma, &mut states[queue_index])?
+            let mut states = self.queue_states.lock().await;
+            queue.pop(&self.resources.dma, &mut states[queue_index])?
         };
         let Some(chain) = chain else {
             return Ok(None);
         };
-        let (request, reply) = parse_chain(&self.own_imm_resources.dma, &chain)?;
+        let (request, reply) = parse_chain(&self.resources.dma, &chain)?;
         Ok(Some(FsWork {
-            imm_queue_index: queue_index,
-            own_imm_chain: chain,
-            own_imm_request: request,
-            own_imm_reply: reply,
+            queue_index,
+            chain,
+            request,
+            reply,
         }))
     }
 
     async fn execute_work(&self, work: FsWork) -> Result<FsCompletion, DeviceError> {
         self.check_live()?;
-        let root = self.own_imm_root.clone();
-        let inodes = Arc::clone(&self.arc_imm_inodes);
-        let request = work.own_imm_request.clone();
+        let root = self.root.clone();
+        let inodes = Arc::clone(&self.inodes);
+        let request = work.request.clone();
         let reply = tokio::task::spawn_blocking(move || execute_request(&root, &inodes, &request))
             .await
             .map_err(|error| DeviceError::Worker(error.to_string()))??;
-        Ok(FsCompletion {
-            own_imm_work: work,
-            own_imm_reply: reply,
-        })
+        Ok(FsCompletion { work, reply })
     }
 
     async fn complete_work(&self, completion: FsCompletion) -> Result<(), DeviceError> {
-        let work = completion.own_imm_work;
-        let used_length = write_reply(
-            &self.own_imm_resources.dma,
-            &work.own_imm_reply,
-            &completion.own_imm_reply,
-        )?;
-        let queue_layout = self.own_imm_resources.queues[work.imm_queue_index];
-        let queue = VirtQueue::new(queue_layout, &self.own_imm_resources.dma)?;
+        let work = completion.work;
+        let used_length = write_reply(&self.resources.dma, &work.reply, &completion.reply)?;
+        let queue_layout = self.resources.queues[work.queue_index];
+        let queue = VirtQueue::new(queue_layout, &self.resources.dma)?;
         {
-            let mut states = self.own_mut_queue_states.lock().await;
+            let mut states = self.queue_states.lock().await;
             queue.complete(
-                &self.own_imm_resources.dma,
-                &mut states[work.imm_queue_index],
-                &work.own_imm_chain,
+                &self.resources.dma,
+                &mut states[work.queue_index],
+                &work.chain,
                 used_length,
             )?;
         }
-        let notifier = self
-            .own_imm_resources
-            .interrupts
-            .get(work.imm_queue_index)
-            .ok_or(DeviceError::InvalidLayout(
-                "missing virtio-fs interrupt notifier",
-            ))?;
+        let notifier =
+            self.resources
+                .interrupts
+                .get(work.queue_index)
+                .ok_or(DeviceError::InvalidLayout(
+                    "missing virtio-fs interrupt notifier",
+                ))?;
         notifier
             .notify(Interrupt::Queue {
-                queue_index: u16::try_from(work.imm_queue_index)
+                queue_index: u16::try_from(work.queue_index)
                     .map_err(|_| DeviceError::InvalidLayout("queue index exceeds u16"))?,
-                vector: u16::try_from(work.imm_queue_index)
+                vector: u16::try_from(work.queue_index)
                     .map_err(|_| DeviceError::InvalidLayout("queue vector exceeds u16"))?,
             })
             .await
@@ -286,18 +279,18 @@ fn execute_request(
     request: &[u8],
 ) -> Result<Vec<u8>, DeviceError> {
     let header = FuseInHeader::parse(request)?;
-    if usize::try_from(header.imm_length).ok() != Some(request.len()) {
-        return Ok(error_reply(header.imm_unique, libc::EINVAL));
+    if usize::try_from(header.length).ok() != Some(request.len()) {
+        return Ok(error_reply(header.unique, libc::EINVAL));
     }
     let payload = &request[FUSE_IN_HEADER_SIZE..];
     if matches!(
-        header.imm_opcode,
+        header.opcode,
         FUSE_FORGET | FUSE_RELEASE | FUSE_RELEASEDIR | FUSE_DESTROY
     ) {
         return Ok(Vec::new());
     }
     if !matches!(
-        header.imm_opcode,
+        header.opcode,
         FUSE_INIT
             | FUSE_LOOKUP
             | FUSE_GETATTR
@@ -307,21 +300,21 @@ fn execute_request(
             | FUSE_READDIR
             | FUSE_STATFS
     ) {
-        return Ok(error_reply(header.imm_unique, libc::ENOSYS));
+        return Ok(error_reply(header.unique, libc::ENOSYS));
     }
-    let result = match header.imm_opcode {
+    let result = match header.opcode {
         FUSE_INIT => init_reply(payload),
-        FUSE_LOOKUP => lookup_reply(root, inodes, header.imm_node_id, payload),
-        FUSE_GETATTR => getattr_reply(inodes, header.imm_node_id),
-        FUSE_OPEN | FUSE_OPENDIR => open_reply(inodes, header.imm_node_id),
-        FUSE_READ => read_reply(inodes, header.imm_node_id, payload),
-        FUSE_READDIR => readdir_reply(root, inodes, header.imm_node_id, payload),
+        FUSE_LOOKUP => lookup_reply(root, inodes, header.node_id, payload),
+        FUSE_GETATTR => getattr_reply(inodes, header.node_id),
+        FUSE_OPEN | FUSE_OPENDIR => open_reply(inodes, header.node_id),
+        FUSE_READ => read_reply(inodes, header.node_id, payload),
+        FUSE_READDIR => readdir_reply(root, inodes, header.node_id, payload),
         FUSE_STATFS => Ok(statfs_reply()),
         _ => unreachable!("checked above"),
     };
     match result {
-        Ok(body) => Ok(success_reply(header.imm_unique, &body)),
-        Err(error) => Ok(error_reply(header.imm_unique, fuse_errno(&error))),
+        Ok(body) => Ok(success_reply(header.unique, &body)),
+        Err(error) => Ok(error_reply(header.unique, fuse_errno(&error))),
     }
 }
 
@@ -337,10 +330,10 @@ fn fuse_errno(error: &DeviceError) -> i32 {
 
 #[derive(Clone, Copy)]
 struct FuseInHeader {
-    imm_length: u32,
-    imm_opcode: u32,
-    imm_unique: u64,
-    imm_node_id: u64,
+    length: u32,
+    opcode: u32,
+    unique: u64,
+    node_id: u64,
 }
 
 impl FuseInHeader {
@@ -349,10 +342,10 @@ impl FuseInHeader {
             return Err(DeviceError::Descriptor("short FUSE request header"));
         }
         Ok(Self {
-            imm_length: read_u32(bytes, 0)?,
-            imm_opcode: read_u32(bytes, 4)?,
-            imm_unique: read_u64(bytes, 8)?,
-            imm_node_id: read_u64(bytes, 16)?,
+            length: read_u32(bytes, 0)?,
+            opcode: read_u32(bytes, 4)?,
+            unique: read_u64(bytes, 8)?,
+            node_id: read_u64(bytes, 16)?,
         })
     }
 }
@@ -400,7 +393,7 @@ fn lookup_reply(
         .lock()
         .map_err(|_| DeviceError::Worker("virtio-fs inode lock poisoned".into()))?;
     let parent_path = guard
-        .own_by_id
+        .by_id
         .get(&parent)
         .ok_or(DeviceError::Descriptor("unknown FUSE parent inode"))?;
     let path = parent_path.join(name);
@@ -422,7 +415,7 @@ fn getattr_reply(
         .lock()
         .map_err(|_| DeviceError::Worker("virtio-fs inode lock poisoned".into()))?;
     let path = guard
-        .own_by_id
+        .by_id
         .get(&node_id)
         .ok_or(DeviceError::Descriptor("unknown FUSE inode"))?;
     let metadata = fs::symlink_metadata(path)?;
@@ -442,7 +435,7 @@ fn open_reply(inodes: &std::sync::Mutex<FsInodes>, node_id: u64) -> Result<Vec<u
         .lock()
         .map_err(|_| DeviceError::Worker("virtio-fs inode lock poisoned".into()))?;
     let path = guard
-        .own_by_id
+        .by_id
         .get(&node_id)
         .ok_or(DeviceError::Descriptor("unknown FUSE inode"))?;
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
@@ -472,7 +465,7 @@ fn read_reply(
             .lock()
             .map_err(|_| DeviceError::Worker("virtio-fs inode lock poisoned".into()))?;
         guard
-            .own_by_id
+            .by_id
             .get(&node_id)
             .cloned()
             .ok_or(DeviceError::Descriptor("unknown FUSE inode"))?
@@ -502,7 +495,7 @@ fn readdir_reply(
             .lock()
             .map_err(|_| DeviceError::Worker("virtio-fs inode lock poisoned".into()))?;
         guard
-            .own_by_id
+            .by_id
             .get(&node_id)
             .cloned()
             .ok_or(DeviceError::Descriptor("unknown FUSE inode"))?
@@ -709,9 +702,9 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, DeviceError> {
 impl DeviceDeclaration for FsDeclaration {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
-            queue_count: self.imm_request_queue_count + 1,
-            maximum_queue_size: self.imm_maximum_queue_size,
-            notifier_count: self.imm_request_queue_count + 1,
+            queue_count: self.request_queue_count + 1,
+            maximum_queue_size: self.maximum_queue_size,
+            notifier_count: self.request_queue_count + 1,
             required_features: VIRTIO_F_VERSION_1,
             optional_features: 0,
         }
@@ -729,18 +722,18 @@ impl DeviceDeclaration for FsDeclaration {
 #[async_trait]
 impl DeviceInstance for FsDevice {
     fn kick(&self) {
-        self.own_imm_wake.notify_one();
+        self.wake.notify_one();
     }
 
     fn stop(&self, _reason: DeviceDownReason) {
-        self.atomic_mut_down.store(true, Ordering::Release);
-        self.own_imm_resources.dma.revoke();
-        self.own_imm_wake.notify_waiters();
+        self.down.store(true, Ordering::Release);
+        self.resources.dma.revoke();
+        self.wake.notify_waiters();
     }
 
     async fn run(&self) -> Result<(), DeviceError> {
         let maximum_inflight = self
-            .own_imm_resources
+            .resources
             .queues
             .len()
             .saturating_mul(MAXIMUM_INFLIGHT_PER_QUEUE)
@@ -749,20 +742,20 @@ impl DeviceInstance for FsDevice {
         let mut next_queue = 0usize;
         let mut scan_queues = false;
         loop {
-            if !scan_queues && pending.is_empty() && !self.atomic_mut_down.load(Ordering::Acquire) {
-                let notified = self.own_imm_wake.notified();
-                if !self.atomic_mut_down.load(Ordering::Acquire) {
+            if !scan_queues && pending.is_empty() && !self.down.load(Ordering::Acquire) {
+                let notified = self.wake.notified();
+                if !self.down.load(Ordering::Acquire) {
                     notified.await;
                     scan_queues = true;
                 }
             }
-            while !self.atomic_mut_down.load(Ordering::Acquire)
+            while !self.down.load(Ordering::Acquire)
                 && scan_queues
                 && pending.len() < maximum_inflight
             {
                 let mut work = None;
-                for _ in 0..self.own_imm_resources.queues.len() {
-                    let queue_index = next_queue % self.own_imm_resources.queues.len();
+                for _ in 0..self.resources.queues.len() {
+                    let queue_index = next_queue % self.resources.queues.len();
                     next_queue = next_queue.wrapping_add(1);
                     if let Some(next) = self.take_work(queue_index).await? {
                         work = Some(next);
@@ -775,8 +768,8 @@ impl DeviceInstance for FsDevice {
                 pending.push(self.execute_work(work));
             }
             scan_queues = false;
-            if self.atomic_mut_down.load(Ordering::Acquire) && pending.is_empty() {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            if self.down.load(Ordering::Acquire) && pending.is_empty() {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
             if pending.is_empty() {
@@ -785,12 +778,12 @@ impl DeviceInstance for FsDevice {
             tokio::select! {
                 result = pending.next() => {
                     let completion = result.expect("pending virtio-fs completion exists")?;
-                    if !self.atomic_mut_down.load(Ordering::Acquire) {
+                    if !self.down.load(Ordering::Acquire) {
                         self.complete_work(completion).await?;
                         scan_queues = true;
                     }
                 }
-                _ = self.own_imm_wake.notified() => { scan_queues = true; }
+                _ = self.wake.notified() => { scan_queues = true; }
             }
         }
     }

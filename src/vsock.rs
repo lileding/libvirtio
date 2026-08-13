@@ -114,9 +114,9 @@ pub trait VsockBackend: Send + Sync {
 }
 
 pub struct VsockDeclaration {
-    imm_guest_cid: u64,
-    imm_maximum_queue_size: u16,
-    own_imm_backend: Arc<dyn VsockBackend>,
+    guest_cid: u64,
+    maximum_queue_size: u16,
+    backend: Arc<dyn VsockBackend>,
 }
 
 impl VsockDeclaration {
@@ -134,26 +134,26 @@ impl VsockDeclaration {
             ));
         }
         Ok(Self {
-            imm_guest_cid: guest_cid,
-            imm_maximum_queue_size: maximum_queue_size,
-            own_imm_backend: backend,
+            guest_cid,
+            maximum_queue_size,
+            backend,
         })
     }
 
     pub const fn guest_cid(&self) -> u64 {
-        self.imm_guest_cid
+        self.guest_cid
     }
 }
 
 struct VsockDevice {
-    own_imm_resources: DeviceResources,
-    own_imm_backend: Arc<dyn VsockBackend>,
-    own_mut_queue_states: Mutex<Vec<QueueState>>,
-    own_imm_wake: Notify,
-    atomic_mut_kicked: AtomicBool,
-    atomic_mut_down: AtomicBool,
-    imm_stream_supported: bool,
-    imm_seqpacket_supported: bool,
+    resources: DeviceResources,
+    backend: Arc<dyn VsockBackend>,
+    queue_states: Mutex<Vec<QueueState>>,
+    wake: Notify,
+    kicked: AtomicBool,
+    down: AtomicBool,
+    stream_supported: bool,
+    seqpacket_supported: bool,
 }
 
 #[async_trait]
@@ -161,7 +161,7 @@ impl DeviceDeclaration for VsockDeclaration {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
             queue_count: QUEUE_COUNT,
-            maximum_queue_size: self.imm_maximum_queue_size,
+            maximum_queue_size: self.maximum_queue_size,
             notifier_count: QUEUE_COUNT + 1,
             required_features: VIRTIO_F_VERSION_1,
             optional_features: VIRTIO_VSOCK_F_STREAM | VIRTIO_VSOCK_F_SEQPACKET,
@@ -178,14 +178,14 @@ impl DeviceDeclaration for VsockDeclaration {
         let stream_supported = true;
         let seqpacket_supported = resources.negotiated_features & VIRTIO_VSOCK_F_SEQPACKET != 0;
         Ok(Arc::new(VsockDevice {
-            own_mut_queue_states: Mutex::new(vec![QueueState::new(); QUEUE_COUNT]),
-            own_imm_wake: Notify::new(),
-            own_imm_resources: resources,
-            own_imm_backend: Arc::clone(&self.own_imm_backend),
-            atomic_mut_kicked: AtomicBool::new(false),
-            atomic_mut_down: AtomicBool::new(false),
-            imm_stream_supported: stream_supported,
-            imm_seqpacket_supported: seqpacket_supported,
+            queue_states: Mutex::new(vec![QueueState::new(); QUEUE_COUNT]),
+            wake: Notify::new(),
+            resources,
+            backend: Arc::clone(&self.backend),
+            kicked: AtomicBool::new(false),
+            down: AtomicBool::new(false),
+            stream_supported,
+            seqpacket_supported,
         }))
     }
 }
@@ -193,30 +193,30 @@ impl DeviceDeclaration for VsockDeclaration {
 #[async_trait]
 impl DeviceInstance for VsockDevice {
     fn kick(&self) {
-        self.atomic_mut_kicked.store(true, Ordering::Release);
-        self.own_imm_wake.notify_one();
+        self.kicked.store(true, Ordering::Release);
+        self.wake.notify_one();
     }
 
     fn stop(&self, _reason: DeviceDownReason) {
-        self.atomic_mut_down.store(true, Ordering::Release);
-        self.own_imm_backend.shutdown();
-        self.own_imm_resources.dma.revoke();
-        self.own_imm_wake.notify_waiters();
+        self.down.store(true, Ordering::Release);
+        self.backend.shutdown();
+        self.resources.dma.revoke();
+        self.wake.notify_waiters();
     }
 
     async fn run(&self) -> Result<(), DeviceError> {
         loop {
-            let notified = self.own_imm_wake.notified();
-            if self.atomic_mut_down.load(Ordering::Acquire) {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            let notified = self.wake.notified();
+            if self.down.load(Ordering::Acquire) {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
             notified.await;
-            if self.atomic_mut_down.load(Ordering::Acquire) {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            if self.down.load(Ordering::Acquire) {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
-            if !self.atomic_mut_kicked.swap(false, Ordering::AcqRel) {
+            if !self.kicked.swap(false, Ordering::AcqRel) {
                 continue;
             }
             self.process_tx().await?;
@@ -229,8 +229,8 @@ impl DeviceInstance for VsockDevice {
 impl VsockDevice {
     fn validate_packet_type(&self, packet: &VsockPacket) -> Result<(), DeviceError> {
         let supported = match packet.header.packet_type {
-            VSOCK_TYPE_STREAM => self.imm_stream_supported,
-            VSOCK_TYPE_SEQPACKET => self.imm_seqpacket_supported,
+            VSOCK_TYPE_STREAM => self.stream_supported,
+            VSOCK_TYPE_SEQPACKET => self.seqpacket_supported,
             _ => false,
         };
         if supported {
@@ -245,28 +245,21 @@ impl VsockDevice {
     async fn process_tx(&self) -> Result<(), DeviceError> {
         loop {
             let chain = {
-                let mut states = self.own_mut_queue_states.lock().await;
-                let queue = VirtQueue::new(
-                    self.own_imm_resources.queues[QUEUE_TX],
-                    &self.own_imm_resources.dma,
-                )?;
-                let Some(chain) = queue.pop(&self.own_imm_resources.dma, &mut states[QUEUE_TX])?
-                else {
+                let mut states = self.queue_states.lock().await;
+                let queue = VirtQueue::new(self.resources.queues[QUEUE_TX], &self.resources.dma)?;
+                let Some(chain) = queue.pop(&self.resources.dma, &mut states[QUEUE_TX])? else {
                     return Ok(());
                 };
                 chain
             };
-            let packet = read_packet(&self.own_imm_resources.dma, &chain)?;
+            let packet = read_packet(&self.resources.dma, &chain)?;
             self.validate_packet_type(&packet)?;
             let used_length = packet.header.length.saturating_add(HEADER_SIZE as u32);
-            self.own_imm_backend.receive_packet(packet).await?;
-            let mut states = self.own_mut_queue_states.lock().await;
-            let queue = VirtQueue::new(
-                self.own_imm_resources.queues[QUEUE_TX],
-                &self.own_imm_resources.dma,
-            )?;
+            self.backend.receive_packet(packet).await?;
+            let mut states = self.queue_states.lock().await;
+            let queue = VirtQueue::new(self.resources.queues[QUEUE_TX], &self.resources.dma)?;
             queue.complete(
-                &self.own_imm_resources.dma,
+                &self.resources.dma,
                 &mut states[QUEUE_TX],
                 &chain,
                 used_length,
@@ -278,26 +271,23 @@ impl VsockDevice {
 
     async fn process_rx(&self) -> Result<(), DeviceError> {
         loop {
-            if !self.own_imm_backend.has_packet() {
+            if !self.backend.has_packet() {
                 return Ok(());
             }
-            let mut states = self.own_mut_queue_states.lock().await;
-            let queue = VirtQueue::new(
-                self.own_imm_resources.queues[QUEUE_RX],
-                &self.own_imm_resources.dma,
-            )?;
-            let Some(chain) = queue.pop(&self.own_imm_resources.dma, &mut states[QUEUE_RX])? else {
+            let mut states = self.queue_states.lock().await;
+            let queue = VirtQueue::new(self.resources.queues[QUEUE_RX], &self.resources.dma)?;
+            let Some(chain) = queue.pop(&self.resources.dma, &mut states[QUEUE_RX])? else {
                 return Ok(());
             };
             let packet = self
-                .own_imm_backend
+                .backend
                 .take_packet()
                 .ok_or(DeviceError::Descriptor("vsock packet disappeared"))?;
             self.validate_packet_type(&packet)?;
             let bytes = packet_bytes(&packet)?;
-            write_packet(&self.own_imm_resources.dma, &chain, &bytes)?;
+            write_packet(&self.resources.dma, &chain, &bytes)?;
             queue.complete(
-                &self.own_imm_resources.dma,
+                &self.resources.dma,
                 &mut states[QUEUE_RX],
                 &chain,
                 u32::try_from(bytes.len())
@@ -309,24 +299,16 @@ impl VsockDevice {
     }
 
     async fn process_event(&self) -> Result<(), DeviceError> {
-        let mut states = self.own_mut_queue_states.lock().await;
-        let queue = VirtQueue::new(
-            self.own_imm_resources.queues[QUEUE_EVENT],
-            &self.own_imm_resources.dma,
-        )?;
-        while let Some(chain) = queue.pop(&self.own_imm_resources.dma, &mut states[QUEUE_EVENT])? {
-            queue.complete(
-                &self.own_imm_resources.dma,
-                &mut states[QUEUE_EVENT],
-                &chain,
-                0,
-            )?;
+        let mut states = self.queue_states.lock().await;
+        let queue = VirtQueue::new(self.resources.queues[QUEUE_EVENT], &self.resources.dma)?;
+        while let Some(chain) = queue.pop(&self.resources.dma, &mut states[QUEUE_EVENT])? {
+            queue.complete(&self.resources.dma, &mut states[QUEUE_EVENT], &chain, 0)?;
         }
         Ok(())
     }
 
     async fn notify_queue(&self, queue: usize) -> Result<(), DeviceError> {
-        self.own_imm_resources.interrupts[queue]
+        self.resources.interrupts[queue]
             .notify(Interrupt::Queue {
                 queue_index: u16::try_from(queue).expect("fixed queue index"),
                 vector: u16::try_from(queue).expect("fixed queue vector"),

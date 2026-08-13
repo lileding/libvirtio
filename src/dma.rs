@@ -25,9 +25,9 @@ impl DmaRange {
 /// One directly mapped GPA interval supplied by an embedding transport.
 #[derive(Clone, Copy, Debug)]
 pub struct DmaSegment {
-    imm_gpa: u64,
-    raw_imm_base: NonNull<u8>,
-    imm_length: usize,
+    gpa: u64,
+    base: NonNull<u8>,
+    length: usize,
 }
 
 unsafe impl Send for DmaSegment {}
@@ -39,31 +39,26 @@ impl DmaSegment {
     /// `base..base + length` must map exactly the supplied guest GPA range for
     /// the generation which owns this segment.
     pub unsafe fn new(gpa: u64, base: NonNull<u8>, length: usize) -> Self {
-        Self {
-            imm_gpa: gpa,
-            raw_imm_base: base,
-            imm_length: length,
-        }
+        Self { gpa, base, length }
     }
 
     pub const fn gpa(&self) -> u64 {
-        self.imm_gpa
+        self.gpa
     }
 
     pub const fn length(&self) -> usize {
-        self.imm_length
+        self.length
     }
 
     fn end(&self) -> Option<u64> {
-        self.imm_gpa
-            .checked_add(u64::try_from(self.imm_length).ok()?)
+        self.gpa.checked_add(u64::try_from(self.length).ok()?)
     }
 }
 
 struct DmaLeaseState {
-    atomic_mut_revoked: AtomicBool,
-    atomic_mut_active: AtomicUsize,
-    own_imm_drained: Notify,
+    revoked: AtomicBool,
+    active: AtomicUsize,
+    drained: Notify,
 }
 
 /// A generation-scoped collection of direct guest-memory mappings.
@@ -73,9 +68,9 @@ struct DmaLeaseState {
 /// `DmaLease` for every request and must drop that lease before its task yields
 /// control to teardown.
 pub struct DmaMemory {
-    imm_generation: u64,
-    own_imm_segments: Arc<[DmaSegment]>,
-    arc_imm_lease_state: Arc<DmaLeaseState>,
+    generation: u64,
+    segments: Arc<[DmaSegment]>,
+    lease_state: Arc<DmaLeaseState>,
 }
 
 impl DmaMemory {
@@ -93,47 +88,38 @@ impl DmaMemory {
             }
         }
         Ok(Self {
-            imm_generation: generation,
-            own_imm_segments: segments.into(),
-            arc_imm_lease_state: Arc::new(DmaLeaseState {
-                atomic_mut_revoked: AtomicBool::new(false),
-                atomic_mut_active: AtomicUsize::new(0),
-                own_imm_drained: Notify::new(),
+            generation,
+            segments: segments.into(),
+            lease_state: Arc::new(DmaLeaseState {
+                revoked: AtomicBool::new(false),
+                active: AtomicUsize::new(0),
+                drained: Notify::new(),
             }),
         })
     }
 
     pub const fn generation(&self) -> u64 {
-        self.imm_generation
+        self.generation
     }
 
     pub fn segments(&self) -> &[DmaSegment] {
-        &self.own_imm_segments
+        &self.segments
     }
 
     pub fn is_revoked(&self) -> bool {
-        self.arc_imm_lease_state
-            .atomic_mut_revoked
-            .load(Ordering::Acquire)
+        self.lease_state.revoked.load(Ordering::Acquire)
     }
 
     /// Prevent future leases.  The transport must call `wait_for_drain()`
     /// before it unmaps any segment.
     pub fn revoke(&self) {
-        self.arc_imm_lease_state
-            .atomic_mut_revoked
-            .store(true, Ordering::Release);
+        self.lease_state.revoked.store(true, Ordering::Release);
     }
 
     pub async fn wait_for_drain(&self) {
         loop {
-            let notified = self.arc_imm_lease_state.own_imm_drained.notified();
-            if self
-                .arc_imm_lease_state
-                .atomic_mut_active
-                .load(Ordering::Acquire)
-                == 0
-            {
+            let notified = self.lease_state.drained.notified();
+            if self.lease_state.active.load(Ordering::Acquire) == 0 {
                 return;
             }
             notified.await;
@@ -145,19 +131,19 @@ impl DmaMemory {
     }
 
     pub fn lease(&self, range: DmaRange) -> Result<DmaLease, DeviceError> {
-        let state = &self.arc_imm_lease_state;
-        if state.atomic_mut_revoked.load(Ordering::Acquire) {
+        let state = &self.lease_state;
+        if state.revoked.load(Ordering::Acquire) {
             return Err(DeviceError::Down(DeviceDownReason::Revoked));
         }
-        state.atomic_mut_active.fetch_add(1, Ordering::AcqRel);
-        if state.atomic_mut_revoked.load(Ordering::Acquire) {
+        state.active.fetch_add(1, Ordering::AcqRel);
+        if state.revoked.load(Ordering::Acquire) {
             DmaLease::drop_active(state);
             return Err(DeviceError::Down(DeviceDownReason::Revoked));
         }
         match self.translate(range) {
             Ok(parts) => Ok(DmaLease {
-                own_imm_parts: parts,
-                arc_imm_lease_state: Arc::clone(state),
+                parts,
+                lease_state: Arc::clone(state),
             }),
             Err(error) => {
                 DmaLease::drop_active(state);
@@ -175,7 +161,7 @@ impl DmaMemory {
         let mut parts = Vec::new();
         while cursor < end {
             let segment = self
-                .own_imm_segments
+                .segments
                 .iter()
                 .find(|segment| {
                     segment.gpa() <= cursor && segment.end().is_some_and(|end| cursor < end)
@@ -196,11 +182,9 @@ impl DmaMemory {
                 length: range.length,
             })?;
             parts.push(DmaPart {
-                imm_gpa: cursor,
-                raw_imm_base: unsafe {
-                    NonNull::new_unchecked(segment.raw_imm_base.as_ptr().add(offset))
-                },
-                imm_length: length,
+                gpa: cursor,
+                base: unsafe { NonNull::new_unchecked(segment.base.as_ptr().add(offset)) },
+                length,
             });
             cursor = part_end;
         }
@@ -210,38 +194,38 @@ impl DmaMemory {
 
 /// An active direct-DMA request.  Its destructor releases the generation hold.
 pub struct DmaLease {
-    own_imm_parts: Vec<DmaPart>,
-    arc_imm_lease_state: Arc<DmaLeaseState>,
+    parts: Vec<DmaPart>,
+    lease_state: Arc<DmaLeaseState>,
 }
 
 impl DmaLease {
     pub fn parts(&self) -> &[DmaPart] {
-        &self.own_imm_parts
+        &self.parts
     }
 
     pub fn parts_mut(&mut self) -> &mut [DmaPart] {
-        &mut self.own_imm_parts
+        &mut self.parts
     }
 
     fn drop_active(state: &DmaLeaseState) {
-        if state.atomic_mut_active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            state.own_imm_drained.notify_waiters();
+        if state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            state.drained.notify_waiters();
         }
     }
 }
 
 impl Drop for DmaLease {
     fn drop(&mut self) {
-        Self::drop_active(&self.arc_imm_lease_state);
+        Self::drop_active(&self.lease_state);
     }
 }
 
 /// A contiguous part of a DMA lease.  It may be converted to an I/O vector
 /// only while its parent lease is alive and before the task awaits teardown.
 pub struct DmaPart {
-    imm_gpa: u64,
-    raw_imm_base: NonNull<u8>,
-    imm_length: usize,
+    gpa: u64,
+    base: NonNull<u8>,
+    length: usize,
 }
 
 // A DmaLease pins the mapping generation until every part is dropped.  Moving
@@ -251,11 +235,11 @@ unsafe impl Send for DmaPart {}
 
 impl DmaPart {
     pub const fn gpa(&self) -> u64 {
-        self.imm_gpa
+        self.gpa
     }
 
     pub const fn length(&self) -> usize {
-        self.imm_length
+        self.length
     }
 
     /// # Safety
@@ -263,7 +247,7 @@ impl DmaPart {
     /// The pointer is valid only while the parent lease is alive.  The caller
     /// must apply the descriptor's direction and transport synchronization.
     pub unsafe fn as_ptr(&self) -> *mut u8 {
-        self.raw_imm_base.as_ptr()
+        self.base.as_ptr()
     }
 
     /// # Safety
@@ -271,7 +255,7 @@ impl DmaPart {
     /// The caller must not retain the returned slice after its parent lease is
     /// dropped or across a teardown boundary.
     pub unsafe fn read_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.raw_imm_base.as_ptr(), self.imm_length) }
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.length) }
     }
 
     /// # Safety
@@ -279,7 +263,7 @@ impl DmaPart {
     /// The caller must have exclusive access to this range and must not retain
     /// the returned slice after its parent lease is dropped or across teardown.
     pub unsafe fn write_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.raw_imm_base.as_ptr(), self.imm_length) }
+        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.length) }
     }
 }
 

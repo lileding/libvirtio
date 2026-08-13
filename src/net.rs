@@ -38,10 +38,10 @@ pub trait NetBackend: Send + Sync {
 
 #[derive(Clone)]
 pub struct NetDeclaration {
-    imm_mac: [u8; 6],
-    imm_queue_pairs: usize,
-    imm_maximum_queue_size: u16,
-    own_imm_backend: Arc<dyn NetBackend>,
+    mac: [u8; 6],
+    queue_pairs: usize,
+    maximum_queue_size: u16,
+    backend: Arc<dyn NetBackend>,
 }
 
 impl NetDeclaration {
@@ -63,23 +63,23 @@ impl NetDeclaration {
             return Err(DeviceError::InvalidLayout("invalid virtio-net MAC address"));
         }
         Ok(Self {
-            imm_mac: mac,
-            imm_queue_pairs: queue_pairs,
-            imm_maximum_queue_size: maximum_queue_size,
-            own_imm_backend: backend,
+            mac,
+            queue_pairs,
+            maximum_queue_size,
+            backend,
         })
     }
 
     pub const fn mac(&self) -> [u8; 6] {
-        self.imm_mac
+        self.mac
     }
 
     pub fn config_bytes(&self) -> [u8; 10] {
         let mut bytes = [0u8; 10];
-        bytes[..6].copy_from_slice(&self.imm_mac);
+        bytes[..6].copy_from_slice(&self.mac);
         bytes[6..8].copy_from_slice(&VIRTIO_NET_S_LINK_UP.to_le_bytes());
         bytes[8..].copy_from_slice(
-            &u16::try_from(self.imm_queue_pairs)
+            &u16::try_from(self.queue_pairs)
                 .expect("validated queue pair count")
                 .to_le_bytes(),
         );
@@ -88,23 +88,23 @@ impl NetDeclaration {
 }
 
 struct NetDevice {
-    own_imm_resources: DeviceResources,
-    own_imm_backend: Arc<dyn NetBackend>,
-    own_mut_queue_states: Mutex<Vec<QueueState>>,
-    own_imm_wake: Notify,
-    atomic_mut_kicked: AtomicBool,
-    atomic_mut_down: AtomicBool,
-    atomic_mut_active_queue_pairs: AtomicUsize,
-    atomic_mut_next_rx_pair: AtomicUsize,
+    resources: DeviceResources,
+    backend: Arc<dyn NetBackend>,
+    queue_states: Mutex<Vec<QueueState>>,
+    wake: Notify,
+    kicked: AtomicBool,
+    down: AtomicBool,
+    active_queue_pairs: AtomicUsize,
+    next_rx_pair: AtomicUsize,
 }
 
 #[async_trait]
 impl DeviceDeclaration for NetDeclaration {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
-            queue_count: self.imm_queue_pairs * 2 + 1,
-            maximum_queue_size: self.imm_maximum_queue_size,
-            notifier_count: self.imm_queue_pairs * 2 + 2,
+            queue_count: self.queue_pairs * 2 + 1,
+            maximum_queue_size: self.maximum_queue_size,
+            notifier_count: self.queue_pairs * 2 + 2,
             required_features: VIRTIO_F_VERSION_1,
             optional_features: VIRTIO_NET_F_MAC
                 | VIRTIO_NET_F_STATUS
@@ -120,14 +120,14 @@ impl DeviceDeclaration for NetDeclaration {
         resources.validate(&self.layout())?;
         let queue_count = resources.queues.len();
         Ok(Arc::new(NetDevice {
-            own_imm_resources: resources,
-            own_imm_backend: Arc::clone(&self.own_imm_backend),
-            own_mut_queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
-            own_imm_wake: Notify::new(),
-            atomic_mut_kicked: AtomicBool::new(false),
-            atomic_mut_down: AtomicBool::new(false),
-            atomic_mut_active_queue_pairs: AtomicUsize::new(1),
-            atomic_mut_next_rx_pair: AtomicUsize::new(0),
+            resources,
+            backend: Arc::clone(&self.backend),
+            queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
+            wake: Notify::new(),
+            kicked: AtomicBool::new(false),
+            down: AtomicBool::new(false),
+            active_queue_pairs: AtomicUsize::new(1),
+            next_rx_pair: AtomicUsize::new(0),
         }))
     }
 }
@@ -135,30 +135,30 @@ impl DeviceDeclaration for NetDeclaration {
 #[async_trait]
 impl DeviceInstance for NetDevice {
     fn kick(&self) {
-        self.atomic_mut_kicked.store(true, Ordering::Release);
-        self.own_imm_wake.notify_one();
+        self.kicked.store(true, Ordering::Release);
+        self.wake.notify_one();
     }
 
     fn stop(&self, _reason: DeviceDownReason) {
-        self.atomic_mut_down.store(true, Ordering::Release);
-        self.own_imm_backend.shutdown();
-        self.own_imm_resources.dma.revoke();
-        self.own_imm_wake.notify_waiters();
+        self.down.store(true, Ordering::Release);
+        self.backend.shutdown();
+        self.resources.dma.revoke();
+        self.wake.notify_waiters();
     }
 
     async fn run(&self) -> Result<(), DeviceError> {
         loop {
-            let notified = self.own_imm_wake.notified();
-            if self.atomic_mut_down.load(Ordering::Acquire) {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            let notified = self.wake.notified();
+            if self.down.load(Ordering::Acquire) {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
             notified.await;
-            if self.atomic_mut_down.load(Ordering::Acquire) {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            if self.down.load(Ordering::Acquire) {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
-            if !self.atomic_mut_kicked.swap(false, Ordering::AcqRel) {
+            if !self.kicked.swap(false, Ordering::AcqRel) {
                 continue;
             }
             self.process_control().await?;
@@ -177,8 +177,8 @@ impl NetDevice {
                 let Some(chain) = chain else {
                     break;
                 };
-                let frame = read_tx_frame(&self.own_imm_resources.dma, &chain)?;
-                self.own_imm_backend.transmit(frame).await?;
+                let frame = read_tx_frame(&self.resources.dma, &chain)?;
+                self.backend.transmit(frame).await?;
                 self.complete(queue_index, &chain, 0).await?;
             }
         }
@@ -186,18 +186,17 @@ impl NetDevice {
     }
 
     async fn process_rx(&self) -> Result<(), DeviceError> {
-        while self.own_imm_backend.has_frame() {
-            let pair = self.atomic_mut_next_rx_pair.fetch_add(1, Ordering::AcqRel)
-                % self.active_queue_pairs();
+        while self.backend.has_frame() {
+            let pair = self.next_rx_pair.fetch_add(1, Ordering::AcqRel) % self.active_queue_pairs();
             let queue_index = rx_queue(pair);
             let Some(chain) = self.pop(queue_index).await? else {
                 return Ok(());
             };
             let frame = self
-                .own_imm_backend
+                .backend
                 .take_frame()
                 .ok_or(DeviceError::Descriptor("virtio-net frame disappeared"))?;
-            let used_length = write_rx_frame(&self.own_imm_resources.dma, &chain, &frame)?;
+            let used_length = write_rx_frame(&self.resources.dma, &chain, &frame)?;
             self.complete(queue_index, &chain, used_length).await?;
         }
         Ok(())
@@ -210,7 +209,7 @@ impl NetDevice {
                 return Ok(());
             };
             let status = self.handle_control(&chain)?;
-            write_control_status(&self.own_imm_resources.dma, &chain, status)?;
+            write_control_status(&self.resources.dma, &chain, status)?;
             self.complete(queue_index, &chain, 1).await?;
         }
     }
@@ -225,7 +224,7 @@ impl NetDevice {
         if header.flags & VIRTQ_DESC_F_WRITE != 0 || header.length != 2 {
             return Err(DeviceError::Descriptor("invalid virtio-net control header"));
         }
-        let header = read_chain_range(&self.own_imm_resources.dma, header.address, 2)?;
+        let header = read_chain_range(&self.resources.dma, header.address, 2)?;
         if header[0] != VIRTIO_NET_CTRL_MQ || header[1] != VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET {
             return Ok(VIRTIO_NET_ERR);
         }
@@ -235,33 +234,29 @@ impl NetDevice {
                 "invalid virtio-net queue-pair request",
             ));
         }
-        let data = read_chain_range(&self.own_imm_resources.dma, data.address, 2)?;
+        let data = read_chain_range(&self.resources.dma, data.address, 2)?;
         let pairs = usize::from(u16::from_le_bytes(
             data.as_slice().try_into().expect("two bytes"),
         ));
         if pairs == 0 || pairs > self.maximum_queue_pairs() {
             return Ok(VIRTIO_NET_ERR);
         }
-        self.atomic_mut_active_queue_pairs
-            .store(pairs, Ordering::Release);
+        self.active_queue_pairs.store(pairs, Ordering::Release);
         Ok(VIRTIO_NET_OK)
     }
 
     fn maximum_queue_pairs(&self) -> usize {
-        (self.own_imm_resources.queues.len() - 1) / 2
+        (self.resources.queues.len() - 1) / 2
     }
 
     fn active_queue_pairs(&self) -> usize {
-        self.atomic_mut_active_queue_pairs.load(Ordering::Acquire)
+        self.active_queue_pairs.load(Ordering::Acquire)
     }
 
     async fn pop(&self, index: usize) -> Result<Option<DescriptorChain>, DeviceError> {
-        let queue = VirtQueue::new(
-            self.own_imm_resources.queues[index],
-            &self.own_imm_resources.dma,
-        )?;
-        let mut states = self.own_mut_queue_states.lock().await;
-        queue.pop(&self.own_imm_resources.dma, &mut states[index])
+        let queue = VirtQueue::new(self.resources.queues[index], &self.resources.dma)?;
+        let mut states = self.queue_states.lock().await;
+        queue.pop(&self.resources.dma, &mut states[index])
     }
 
     async fn complete(
@@ -270,19 +265,11 @@ impl NetDevice {
         chain: &DescriptorChain,
         used_length: u32,
     ) -> Result<(), DeviceError> {
-        let queue = VirtQueue::new(
-            self.own_imm_resources.queues[index],
-            &self.own_imm_resources.dma,
-        )?;
-        let mut states = self.own_mut_queue_states.lock().await;
-        queue.complete(
-            &self.own_imm_resources.dma,
-            &mut states[index],
-            chain,
-            used_length,
-        )?;
+        let queue = VirtQueue::new(self.resources.queues[index], &self.resources.dma)?;
+        let mut states = self.queue_states.lock().await;
+        queue.complete(&self.resources.dma, &mut states[index], chain, used_length)?;
         drop(states);
-        self.own_imm_resources.interrupts[index]
+        self.resources.interrupts[index]
             .notify(Interrupt::Queue {
                 queue_index: u16::try_from(index).expect("fixed queue index"),
                 vector: u16::try_from(index).expect("fixed vector"),

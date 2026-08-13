@@ -52,11 +52,11 @@ pub struct BlockCompletion {
 
 #[derive(Clone, Debug)]
 pub struct BlockDeclaration {
-    own_imm_path: PathBuf,
-    imm_capacity: u64,
-    imm_queue_count: usize,
-    imm_maximum_queue_size: u16,
-    imm_read_only: bool,
+    path: PathBuf,
+    capacity: u64,
+    queue_count: usize,
+    maximum_queue_size: u16,
+    read_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,51 +87,51 @@ impl BlockDeclaration {
             return Err(DeviceError::InvalidLayout("invalid block queue count"));
         }
         Ok(Self {
-            own_imm_path: path,
-            imm_capacity: capacity,
-            imm_queue_count: queue_count,
-            imm_maximum_queue_size: maximum_queue_size,
-            imm_read_only: false,
+            path,
+            capacity,
+            queue_count,
+            maximum_queue_size,
+            read_only: false,
         })
     }
 
     pub fn read_only(mut self) -> Self {
-        self.imm_read_only = true;
+        self.read_only = true;
         self
     }
 
     pub fn path(&self) -> &Path {
-        &self.own_imm_path
+        &self.path
     }
 
     pub fn config(&self) -> BlockConfig {
         BlockConfig {
-            capacity_sectors: self.imm_capacity / VIRTIO_BLK_SECTOR_SIZE,
-            read_only: self.imm_read_only,
-            queue_count: u16::try_from(self.imm_queue_count).expect("validated queue count"),
+            capacity_sectors: self.capacity / VIRTIO_BLK_SECTOR_SIZE,
+            read_only: self.read_only,
+            queue_count: u16::try_from(self.queue_count).expect("validated queue count"),
         }
     }
 }
 
 pub struct BlockDevice {
-    own_imm_file: File,
-    own_imm_resources: DeviceResources,
-    imm_read_only: bool,
-    imm_capacity: u64,
-    own_mut_queue_states: Mutex<Vec<QueueState>>,
-    own_imm_wake: Notify,
-    atomic_mut_down: AtomicBool,
+    file: File,
+    resources: DeviceResources,
+    read_only: bool,
+    capacity: u64,
+    queue_states: Mutex<Vec<QueueState>>,
+    wake: Notify,
+    down: AtomicBool,
 }
 
 struct BlockWork {
-    imm_queue_index: usize,
-    own_imm_chain: DescriptorChain,
-    own_imm_request: BlockRequest,
+    queue_index: usize,
+    chain: DescriptorChain,
+    request: BlockRequest,
 }
 
 struct BlockWorkCompletion {
-    own_imm_work: BlockWork,
-    imm_completion: BlockCompletion,
+    work: BlockWork,
+    completion: BlockCompletion,
 }
 
 impl BlockDevice {
@@ -141,28 +141,28 @@ impl BlockDevice {
     ) -> Result<Self, DeviceError> {
         let file = OpenOptions::new()
             .read(true)
-            .write(!declaration.imm_read_only)
-            .open(&declaration.own_imm_path)?;
+            .write(!declaration.read_only)
+            .open(&declaration.path)?;
         let capacity = file.metadata()?.len();
-        if capacity != declaration.imm_capacity {
+        if capacity != declaration.capacity {
             return Err(DeviceError::InvalidLayout(
                 "block image changed after declaration",
             ));
         }
         let queue_count = resources.queues.len();
         Ok(Self {
-            own_imm_file: file,
-            own_imm_resources: resources,
-            imm_read_only: declaration.imm_read_only,
-            imm_capacity: capacity,
-            own_mut_queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
-            own_imm_wake: Notify::new(),
-            atomic_mut_down: AtomicBool::new(false),
+            file,
+            resources,
+            read_only: declaration.read_only,
+            capacity,
+            queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
+            wake: Notify::new(),
+            down: AtomicBool::new(false),
         })
     }
 
     pub fn resources(&self) -> &DeviceResources {
-        &self.own_imm_resources
+        &self.resources
     }
 
     pub fn parse_request(
@@ -245,10 +245,10 @@ impl BlockDevice {
             payload.push(memory.lease(*range)?);
         }
         let status = memory.lease(request.status)?;
-        let file = self.own_imm_file.try_clone()?;
-        let capacity = self.imm_capacity;
-        let read_only = self.imm_read_only;
-        let flush_supported = self.own_imm_resources.negotiated_features & VIRTIO_BLK_F_FLUSH != 0;
+        let file = self.file.try_clone()?;
+        let capacity = self.capacity;
+        let read_only = self.read_only;
+        let flush_supported = self.resources.negotiated_features & VIRTIO_BLK_F_FLUSH != 0;
         tokio::task::spawn_blocking(move || {
             let (completion, status_value) =
                 execute_blocking(file, capacity, read_only, flush_supported, request, payload)?;
@@ -260,7 +260,7 @@ impl BlockDevice {
     }
 
     fn check_live(&self) -> Result<(), DeviceError> {
-        if self.atomic_mut_down.load(Ordering::Acquire) {
+        if self.down.load(Ordering::Acquire) {
             return Err(DeviceError::Down(DeviceDownReason::Revoked));
         }
         Ok(())
@@ -268,52 +268,53 @@ impl BlockDevice {
 
     async fn take_work(&self, queue_index: usize) -> Result<Option<BlockWork>, DeviceError> {
         let queue_layout = *self
-            .own_imm_resources
+            .resources
             .queues
             .get(queue_index)
             .ok_or(DeviceError::InvalidLayout("queue index is not configured"))?;
-        let queue = VirtQueue::new(queue_layout, &self.own_imm_resources.dma)?;
+        let queue = VirtQueue::new(queue_layout, &self.resources.dma)?;
         let chain = {
-            let mut states = self.own_mut_queue_states.lock().await;
-            queue.pop(&self.own_imm_resources.dma, &mut states[queue_index])?
+            let mut states = self.queue_states.lock().await;
+            queue.pop(&self.resources.dma, &mut states[queue_index])?
         };
         let Some(chain) = chain else {
             return Ok(None);
         };
-        let request = Self::parse_request(&self.own_imm_resources.dma, &chain)?;
+        let request = Self::parse_request(&self.resources.dma, &chain)?;
         Ok(Some(BlockWork {
-            imm_queue_index: queue_index,
-            own_imm_chain: chain,
-            own_imm_request: request,
+            queue_index,
+            chain,
+            request,
         }))
     }
 
     async fn execute_work(&self, work: BlockWork) -> Result<BlockWorkCompletion, DeviceError> {
         let completion = self
-            .execute(&self.own_imm_resources.dma, work.own_imm_request.clone())
+            .execute(&self.resources.dma, work.request.clone())
             .await?;
-        Ok(BlockWorkCompletion {
-            own_imm_work: work,
-            imm_completion: completion,
-        })
+        Ok(BlockWorkCompletion { work, completion })
     }
 
     async fn complete_work(&self, completion: BlockWorkCompletion) -> Result<(), DeviceError> {
-        let queue_index = completion.own_imm_work.imm_queue_index;
-        let queue_layout = self.own_imm_resources.queues[queue_index];
-        let queue = VirtQueue::new(queue_layout, &self.own_imm_resources.dma)?;
+        let queue_index = completion.work.queue_index;
+        let queue_layout = self.resources.queues[queue_index];
+        let queue = VirtQueue::new(queue_layout, &self.resources.dma)?;
         {
-            let mut states = self.own_mut_queue_states.lock().await;
+            let mut states = self.queue_states.lock().await;
             queue.complete(
-                &self.own_imm_resources.dma,
+                &self.resources.dma,
                 &mut states[queue_index],
-                &completion.own_imm_work.own_imm_chain,
-                completion.imm_completion.used_length,
+                &completion.work.chain,
+                completion.completion.used_length,
             )?;
         }
-        let notifier = self.own_imm_resources.interrupts.get(queue_index).ok_or(
-            DeviceError::InvalidLayout("missing queue interrupt notifier"),
-        )?;
+        let notifier =
+            self.resources
+                .interrupts
+                .get(queue_index)
+                .ok_or(DeviceError::InvalidLayout(
+                    "missing queue interrupt notifier",
+                ))?;
         notifier
             .notify(crate::interrupt::Interrupt::Queue {
                 queue_index: u16::try_from(queue_index)
@@ -471,12 +472,12 @@ fn write_status(mut lease: DmaLease, status: u8) -> Result<(), DeviceError> {
 impl DeviceDeclaration for BlockDeclaration {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
-            queue_count: self.imm_queue_count,
-            maximum_queue_size: self.imm_maximum_queue_size,
-            notifier_count: self.imm_queue_count,
+            queue_count: self.queue_count,
+            maximum_queue_size: self.maximum_queue_size,
+            notifier_count: self.queue_count,
             required_features: VIRTIO_F_VERSION_1,
             optional_features: VIRTIO_BLK_F_FLUSH
-                | if self.imm_queue_count > 1 {
+                | if self.queue_count > 1 {
                     VIRTIO_BLK_F_MQ
                 } else {
                     0
@@ -496,18 +497,18 @@ impl DeviceDeclaration for BlockDeclaration {
 #[async_trait]
 impl DeviceInstance for BlockDevice {
     fn kick(&self) {
-        self.own_imm_wake.notify_one();
+        self.wake.notify_one();
     }
 
     fn stop(&self, _reason: DeviceDownReason) {
-        self.atomic_mut_down.store(true, Ordering::Release);
-        self.own_imm_resources.dma.revoke();
-        self.own_imm_wake.notify_waiters();
+        self.down.store(true, Ordering::Release);
+        self.resources.dma.revoke();
+        self.wake.notify_waiters();
     }
 
     async fn run(&self) -> Result<(), DeviceError> {
         let maximum_inflight = self
-            .own_imm_resources
+            .resources
             .queues
             .len()
             .saturating_mul(MAXIMUM_INFLIGHT_PER_QUEUE)
@@ -516,20 +517,20 @@ impl DeviceInstance for BlockDevice {
         let mut next_queue = 0usize;
         let mut scan_queues = false;
         loop {
-            if !scan_queues && pending.is_empty() && !self.atomic_mut_down.load(Ordering::Acquire) {
-                let notified = self.own_imm_wake.notified();
-                if !self.atomic_mut_down.load(Ordering::Acquire) {
+            if !scan_queues && pending.is_empty() && !self.down.load(Ordering::Acquire) {
+                let notified = self.wake.notified();
+                if !self.down.load(Ordering::Acquire) {
                     notified.await;
                     scan_queues = true;
                 }
             }
-            while !self.atomic_mut_down.load(Ordering::Acquire)
+            while !self.down.load(Ordering::Acquire)
                 && scan_queues
                 && pending.len() < maximum_inflight
             {
                 let mut work = None;
-                for _ in 0..self.own_imm_resources.queues.len() {
-                    let queue_index = next_queue % self.own_imm_resources.queues.len();
+                for _ in 0..self.resources.queues.len() {
+                    let queue_index = next_queue % self.resources.queues.len();
                     next_queue = next_queue.wrapping_add(1);
                     if let Some(next) = self.take_work(queue_index).await? {
                         work = Some(next);
@@ -543,8 +544,8 @@ impl DeviceInstance for BlockDevice {
             }
             scan_queues = false;
 
-            if self.atomic_mut_down.load(Ordering::Acquire) && pending.is_empty() {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            if self.down.load(Ordering::Acquire) && pending.is_empty() {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
 
@@ -555,12 +556,12 @@ impl DeviceInstance for BlockDevice {
             tokio::select! {
                 result = pending.next() => {
                     let completion = result.expect("pending completion exists")?;
-                    if !self.atomic_mut_down.load(Ordering::Acquire) {
+                    if !self.down.load(Ordering::Acquire) {
                         self.complete_work(completion).await?;
                         scan_queues = true;
                     }
                 }
-                _ = self.own_imm_wake.notified() => { scan_queues = true; }
+                _ = self.wake.notified() => { scan_queues = true; }
             }
         }
     }
@@ -588,7 +589,7 @@ mod tests {
 
     #[derive(Default)]
     struct TestNotifier {
-        atomic_mut_count: AtomicUsize,
+        count: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -601,7 +602,7 @@ mod tests {
                     vector: 0
                 }
             );
-            self.atomic_mut_count.fetch_add(1, Ordering::Release);
+            self.count.fetch_add(1, Ordering::Release);
             Ok(())
         }
     }
@@ -781,7 +782,7 @@ mod tests {
             &[VIRTIO_BLK_S_OK]
         );
         drop(status);
-        assert_eq!(notifier.atomic_mut_count.load(Ordering::Acquire), 1);
+        assert_eq!(notifier.count.load(Ordering::Acquire), 1);
         device.stop(DeviceDownReason::Stop);
         fs::remove_file(path).expect("remove image");
     }

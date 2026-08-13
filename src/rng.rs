@@ -39,7 +39,7 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 
 #[derive(Clone, Debug)]
 pub struct RngDeclaration {
-    imm_maximum_queue_size: u16,
+    maximum_queue_size: u16,
 }
 
 impl RngDeclaration {
@@ -47,17 +47,15 @@ impl RngDeclaration {
         if maximum_queue_size == 0 || !maximum_queue_size.is_power_of_two() {
             return Err(DeviceError::InvalidLayout("invalid virtio-rng queue size"));
         }
-        Ok(Self {
-            imm_maximum_queue_size: maximum_queue_size,
-        })
+        Ok(Self { maximum_queue_size })
     }
 }
 
 struct RngDevice {
-    own_imm_resources: DeviceResources,
-    own_mut_queue_state: Mutex<QueueState>,
-    own_imm_wake: Notify,
-    atomic_mut_down: AtomicBool,
+    resources: DeviceResources,
+    queue_state: Mutex<QueueState>,
+    wake: Notify,
+    down: AtomicBool,
 }
 
 #[async_trait]
@@ -65,7 +63,7 @@ impl DeviceDeclaration for RngDeclaration {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
             queue_count: QUEUE_COUNT,
-            maximum_queue_size: self.imm_maximum_queue_size,
+            maximum_queue_size: self.maximum_queue_size,
             notifier_count: QUEUE_COUNT,
             required_features: VIRTIO_F_VERSION_1,
             optional_features: 0,
@@ -78,10 +76,10 @@ impl DeviceDeclaration for RngDeclaration {
     ) -> Result<Arc<dyn DeviceInstance>, DeviceError> {
         resources.validate(&self.layout())?;
         Ok(Arc::new(RngDevice {
-            own_imm_resources: resources,
-            own_mut_queue_state: Mutex::new(QueueState::new()),
-            own_imm_wake: Notify::new(),
-            atomic_mut_down: AtomicBool::new(false),
+            resources,
+            queue_state: Mutex::new(QueueState::new()),
+            wake: Notify::new(),
+            down: AtomicBool::new(false),
         }))
     }
 }
@@ -89,25 +87,25 @@ impl DeviceDeclaration for RngDeclaration {
 #[async_trait]
 impl DeviceInstance for RngDevice {
     fn kick(&self) {
-        self.own_imm_wake.notify_one();
+        self.wake.notify_one();
     }
 
     fn stop(&self, _reason: DeviceDownReason) {
-        self.atomic_mut_down.store(true, Ordering::Release);
-        self.own_imm_resources.dma.revoke();
-        self.own_imm_wake.notify_waiters();
+        self.down.store(true, Ordering::Release);
+        self.resources.dma.revoke();
+        self.wake.notify_waiters();
     }
 
     async fn run(&self) -> Result<(), DeviceError> {
         loop {
-            let notified = self.own_imm_wake.notified();
-            if self.atomic_mut_down.load(Ordering::Acquire) {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            let notified = self.wake.notified();
+            if self.down.load(Ordering::Acquire) {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
             notified.await;
-            if self.atomic_mut_down.load(Ordering::Acquire) {
-                self.own_imm_resources.dma.wait_for_drain().await;
+            if self.down.load(Ordering::Acquire) {
+                self.resources.dma.wait_for_drain().await;
                 return Ok(());
             }
             while self.process_queue().await? {}
@@ -117,23 +115,20 @@ impl DeviceInstance for RngDevice {
 
 impl RngDevice {
     async fn process_queue(&self) -> Result<bool, DeviceError> {
-        let queue = VirtQueue::new(
-            self.own_imm_resources.queues[QUEUE_RNG],
-            &self.own_imm_resources.dma,
-        )?;
+        let queue = VirtQueue::new(self.resources.queues[QUEUE_RNG], &self.resources.dma)?;
         let chain = {
-            let mut state = self.own_mut_queue_state.lock().await;
-            queue.pop(&self.own_imm_resources.dma, &mut state)?
+            let mut state = self.queue_state.lock().await;
+            queue.pop(&self.resources.dma, &mut state)?
         };
         let Some(chain) = chain else {
             return Ok(false);
         };
-        let length = fill_chain(&self.own_imm_resources.dma, &chain)?;
+        let length = fill_chain(&self.resources.dma, &chain)?;
         {
-            let mut state = self.own_mut_queue_state.lock().await;
-            queue.complete(&self.own_imm_resources.dma, &mut state, &chain, length)?;
+            let mut state = self.queue_state.lock().await;
+            queue.complete(&self.resources.dma, &mut state, &chain, length)?;
         }
-        self.own_imm_resources.interrupts[QUEUE_RNG]
+        self.resources.interrupts[QUEUE_RNG]
             .notify(Interrupt::Queue {
                 queue_index: QUEUE_RNG as u16,
                 vector: QUEUE_RNG as u16,
