@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex, Notify};
 
-use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
+use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 use crate::dma::{DmaLease, DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
 use crate::queue::{DescriptorChain, QueueState, VirtQueue};
@@ -51,7 +51,7 @@ pub struct BlockCompletion {
 }
 
 #[derive(Clone, Debug)]
-pub struct BlockDeclaration {
+pub struct BlockSpec {
     path: PathBuf,
     capacity: u64,
     queue_count: usize,
@@ -66,7 +66,7 @@ pub struct BlockConfig {
     pub queue_count: u16,
 }
 
-impl BlockDeclaration {
+impl BlockSpec {
     pub fn open(
         path: impl Into<PathBuf>,
         queue_count: usize,
@@ -135,25 +135,20 @@ struct BlockWorkCompletion {
 }
 
 impl BlockDevice {
-    fn open(
-        declaration: &BlockDeclaration,
-        resources: DeviceResources,
-    ) -> Result<Self, DeviceError> {
+    fn open(spec: &BlockSpec, resources: DeviceResources) -> Result<Self, DeviceError> {
         let file = OpenOptions::new()
             .read(true)
-            .write(!declaration.read_only)
-            .open(&declaration.path)?;
+            .write(!spec.read_only)
+            .open(&spec.path)?;
         let capacity = file.metadata()?.len();
-        if capacity != declaration.capacity {
-            return Err(DeviceError::InvalidLayout(
-                "block image changed after declaration",
-            ));
+        if capacity != spec.capacity {
+            return Err(DeviceError::InvalidLayout("block image changed after spec"));
         }
         let queue_count = resources.queues.len();
         Ok(Self {
             file,
             resources,
-            read_only: declaration.read_only,
+            read_only: spec.read_only,
             capacity,
             queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
             wake: Notify::new(),
@@ -469,7 +464,7 @@ fn write_status(mut lease: DmaLease, status: u8) -> Result<(), DeviceError> {
 }
 
 #[async_trait]
-impl DeviceDeclaration for BlockDeclaration {
+impl DeviceSpec for BlockSpec {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
             queue_count: self.queue_count,
@@ -577,11 +572,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BlockDeclaration, BlockDevice, BlockRequest, BlockRequestType, VIRTIO_BLK_F_FLUSH,
+        BlockDevice, BlockRequest, BlockRequestType, BlockSpec, VIRTIO_BLK_F_FLUSH,
         VIRTIO_BLK_F_MQ, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_OUT,
         VIRTIO_F_VERSION_1,
     };
-    use crate::device::{DeviceDeclaration, DeviceInstance, DeviceResources};
+    use crate::device::{DeviceInstance, DeviceResources, DeviceSpec};
     use crate::dma::{DmaMemory, DmaRange, DmaSegment};
     use crate::error::{DeviceDownReason, DeviceError};
     use crate::interrupt::{Interrupt, InterruptNotifier};
@@ -640,9 +635,9 @@ mod tests {
     fn modern_block_requires_version_one() {
         let path = image_path();
         fs::write(&path, vec![0u8; 512]).expect("create image");
-        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
-        assert_eq!(declaration.layout().required_features, VIRTIO_F_VERSION_1);
-        assert_eq!(declaration.layout().optional_features, VIRTIO_BLK_F_FLUSH);
+        let spec = BlockSpec::open(&path, 1, 128).expect("declare image");
+        assert_eq!(spec.layout().required_features, VIRTIO_F_VERSION_1);
+        assert_eq!(spec.layout().optional_features, VIRTIO_BLK_F_FLUSH);
         fs::remove_file(path).expect("remove image");
     }
 
@@ -668,9 +663,9 @@ mod tests {
         memory[0x200..0x204].copy_from_slice(&(0u32).to_le_bytes());
         memory[0x208..0x210].copy_from_slice(&(1u64).to_le_bytes());
 
-        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
+        let spec = BlockSpec::open(&path, 1, 128).expect("declare image");
         let device = BlockDevice::open(
-            &declaration,
+            &spec,
             resources(&mut memory, Arc::new(TestNotifier::default())),
         )
         .expect("open image");
@@ -732,9 +727,9 @@ mod tests {
         memory[0x84..0x86].copy_from_slice(&0u16.to_le_bytes());
 
         let notifier = Arc::new(TestNotifier::default());
-        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
-        let device = BlockDevice::open(&declaration, resources(&mut memory, notifier.clone()))
-            .expect("open image");
+        let spec = BlockSpec::open(&path, 1, 128).expect("declare image");
+        let device =
+            BlockDevice::open(&spec, resources(&mut memory, notifier.clone())).expect("open image");
         let work = device
             .take_work(0)
             .await
@@ -808,9 +803,9 @@ mod tests {
         memory[0x208..0x210].copy_from_slice(&(2u64).to_le_bytes());
         memory[0x300..0x304].copy_from_slice(b"out\n");
 
-        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
+        let spec = BlockSpec::open(&path, 1, 128).expect("declare image");
         let device = BlockDevice::open(
-            &declaration,
+            &spec,
             resources(&mut memory, Arc::new(TestNotifier::default())),
         )
         .expect("open image");
@@ -854,9 +849,9 @@ mod tests {
         let path = image_path();
         fs::write(&path, vec![0u8; 4096]).expect("create image");
         let mut memory = [0u8; 4096];
-        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
+        let spec = BlockSpec::open(&path, 1, 128).expect("declare image");
         let device = BlockDevice::open(
-            &declaration,
+            &spec,
             resources(&mut memory, Arc::new(TestNotifier::default())),
         )
         .expect("open image");
@@ -918,12 +913,12 @@ mod tests {
     }
 
     #[test]
-    fn declaration_exposes_immutable_block_config() {
+    fn spec_exposes_immutable_block_config() {
         let path = image_path();
         fs::write(&path, vec![0u8; 4096]).expect("create image");
-        let declaration = BlockDeclaration::open(&path, 4, 128).expect("declare image");
+        let spec = BlockSpec::open(&path, 4, 128).expect("declare image");
         assert_eq!(
-            declaration.config(),
+            spec.config(),
             super::BlockConfig {
                 capacity_sectors: 8,
                 read_only: false,
@@ -934,12 +929,12 @@ mod tests {
     }
 
     #[test]
-    fn multiqueue_declaration_advertises_multiqueue_feature() {
+    fn multiqueue_spec_advertises_multiqueue_feature() {
         let path = image_path();
         fs::write(&path, vec![0u8; 4096]).expect("create image");
-        let declaration = BlockDeclaration::open(&path, 4, 128).expect("declare image");
+        let spec = BlockSpec::open(&path, 4, 128).expect("declare image");
         assert_eq!(
-            declaration.layout().optional_features,
+            spec.layout().optional_features,
             VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_MQ
         );
         fs::remove_file(path).expect("remove image");

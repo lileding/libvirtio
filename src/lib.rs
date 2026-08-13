@@ -9,7 +9,7 @@ pub mod dma;
 pub mod error;
 pub mod fs;
 pub mod interrupt;
-pub mod net;
+pub mod network;
 pub mod queue;
 #[cfg(any(
     target_vendor = "apple",
@@ -29,14 +29,14 @@ pub mod queue;
 pub mod rng;
 pub mod vsock;
 
-pub use block::{BlockConfig, BlockDeclaration, BlockDevice};
-pub use device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
+pub use block::{BlockConfig, BlockDevice, BlockSpec};
+pub use device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 pub use dma::{DmaLease, DmaMemory, DmaPart, DmaRange, DmaSegment};
 pub use error::{DeviceDownReason, DeviceError};
-pub use fs::{FsConfig, FsDeclaration, VIRTIO_F_VERSION_1 as FS_F_VERSION_1, VIRTIO_FS_TAG_SIZE};
+pub use fs::{FsConfig, FsSpec, VIRTIO_F_VERSION_1 as FS_F_VERSION_1, VIRTIO_FS_TAG_SIZE};
 pub use interrupt::{Interrupt, InterruptNotifier};
-pub use net::{
-    NetBackend, NetDeclaration, VIRTIO_F_VERSION_1 as NET_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ,
+pub use network::{
+    NetworkBackend, NetworkSpec, VIRTIO_F_VERSION_1 as NETWORK_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ,
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
 };
 pub use queue::{QueueLayout, QueueState, VirtQueue};
@@ -55,10 +55,10 @@ pub use queue::{QueueLayout, QueueState, VirtQueue};
     target_os = "solaris",
     target_os = "wasi",
 ))]
-pub use rng::{RngDeclaration, VIRTIO_F_VERSION_1 as RNG_F_VERSION_1};
+pub use rng::{RngSpec, VIRTIO_F_VERSION_1 as RNG_F_VERSION_1};
 pub use vsock::{
     VIRTIO_F_VERSION_1 as VSOCK_F_VERSION_1, VIRTIO_VSOCK_F_SEQPACKET, VIRTIO_VSOCK_F_STREAM,
     VSOCK_HOST_CID, VSOCK_OP_CREDIT_REQUEST, VSOCK_OP_CREDIT_UPDATE, VSOCK_OP_REQUEST,
     VSOCK_OP_RESPONSE, VSOCK_OP_RST, VSOCK_OP_RW, VSOCK_OP_SHUTDOWN, VSOCK_TYPE_SEQPACKET,
-    VSOCK_TYPE_STREAM, VsockBackend, VsockDeclaration, VsockHeader, VsockPacket,
+    VSOCK_TYPE_STREAM, VsockBackend, VsockHeader, VsockPacket, VsockSpec,
 };

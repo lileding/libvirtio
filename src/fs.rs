@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex, Notify};
 
-use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
+use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
 use crate::interrupt::Interrupt;
@@ -53,14 +53,14 @@ pub struct FsConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct FsDeclaration {
+pub struct FsSpec {
     root: PathBuf,
     tag: [u8; VIRTIO_FS_TAG_SIZE],
     request_queue_count: usize,
     maximum_queue_size: u16,
 }
 
-impl FsDeclaration {
+impl FsSpec {
     pub fn open(
         root: impl Into<PathBuf>,
         tag: &str,
@@ -169,13 +169,11 @@ struct FsCompletion {
 }
 
 impl FsDevice {
-    fn new(declaration: &FsDeclaration, resources: DeviceResources) -> Self {
+    fn new(spec: &FsSpec, resources: DeviceResources) -> Self {
         Self {
-            root: declaration.root.clone(),
+            root: spec.root.clone(),
             queue_states: Mutex::new(vec![QueueState::new(); resources.queues.len()]),
-            inodes: Arc::new(std::sync::Mutex::new(FsInodes::new(
-                declaration.root.clone(),
-            ))),
+            inodes: Arc::new(std::sync::Mutex::new(FsInodes::new(spec.root.clone()))),
             resources,
             wake: Notify::new(),
             down: AtomicBool::new(false),
@@ -699,7 +697,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, DeviceError> {
 }
 
 #[async_trait]
-impl DeviceDeclaration for FsDeclaration {
+impl DeviceSpec for FsSpec {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
             queue_count: self.request_queue_count + 1,
@@ -793,9 +791,9 @@ impl DeviceInstance for FsDevice {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::device::DeviceDeclaration;
+    use crate::device::DeviceSpec;
 
-    use super::{FUSE_IN_HEADER_SIZE, FUSE_INIT, FsDeclaration, execute_request};
+    use super::{FUSE_IN_HEADER_SIZE, FUSE_INIT, FsSpec, execute_request};
 
     fn root() -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -808,19 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn declaration_exports_standard_config() {
+    fn spec_exports_standard_config() {
         let root = root();
-        let declaration = FsDeclaration::open(&root, "shared", 2, 128).expect("declaration");
-        assert_eq!(declaration.config_bytes()[..6], *b"shared");
+        let spec = FsSpec::open(&root, "shared", 2, 128).expect("spec");
+        assert_eq!(spec.config_bytes()[..6], *b"shared");
         assert_eq!(
-            u32::from_le_bytes(
-                declaration.config_bytes()[36..40]
-                    .try_into()
-                    .expect("queue count")
-            ),
+            u32::from_le_bytes(spec.config_bytes()[36..40].try_into().expect("queue count")),
             2
         );
-        assert_eq!(declaration.layout().queue_count, 3);
+        assert_eq!(spec.layout().queue_count, 3);
         let entry = root.join("entry");
         std::fs::write(&entry, b"data").expect("create entry");
         let reply = super::entry_out(9, &std::fs::metadata(&entry).expect("entry metadata"));

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
-use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
+use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
 use crate::interrupt::Interrupt;
@@ -38,11 +38,11 @@ const QUEUE_COUNT: usize = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
 #[derive(Clone, Debug)]
-pub struct RngDeclaration {
+pub struct RngSpec {
     maximum_queue_size: u16,
 }
 
-impl RngDeclaration {
+impl RngSpec {
     pub fn new(maximum_queue_size: u16) -> Result<Self, DeviceError> {
         if maximum_queue_size == 0 || !maximum_queue_size.is_power_of_two() {
             return Err(DeviceError::InvalidLayout("invalid virtio-rng queue size"));
@@ -59,7 +59,7 @@ struct RngDevice {
 }
 
 #[async_trait]
-impl DeviceDeclaration for RngDeclaration {
+impl DeviceSpec for RngSpec {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
             queue_count: QUEUE_COUNT,
@@ -164,13 +164,13 @@ fn fill_chain(memory: &DmaMemory, chain: &DescriptorChain) -> Result<u32, Device
 
 #[cfg(test)]
 mod tests {
-    use super::{RngDeclaration, VIRTIO_F_VERSION_1};
-    use crate::device::DeviceDeclaration;
+    use super::{RngSpec, VIRTIO_F_VERSION_1};
+    use crate::device::DeviceSpec;
 
     #[test]
-    fn declaration_requires_modern_virtio() {
-        let declaration = RngDeclaration::new(128).expect("declaration");
-        let layout = declaration.layout();
+    fn spec_requires_modern_virtio() {
+        let spec = RngSpec::new(128).expect("spec");
+        let layout = spec.layout();
         assert_eq!(layout.queue_count, 1);
         assert_eq!(layout.required_features, VIRTIO_F_VERSION_1);
     }

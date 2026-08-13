@@ -50,7 +50,7 @@ impl DeviceResources {
 }
 
 #[async_trait]
-pub trait DeviceDeclaration: Send + Sync {
+pub trait DeviceSpec: Send + Sync {
     fn layout(&self) -> DeviceLayout;
 
     async fn activate(

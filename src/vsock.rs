@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
-use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
+use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
 use crate::interrupt::Interrupt;
@@ -113,13 +113,13 @@ pub trait VsockBackend: Send + Sync {
     fn shutdown(&self);
 }
 
-pub struct VsockDeclaration {
+pub struct VsockSpec {
     guest_cid: u64,
     maximum_queue_size: u16,
     backend: Arc<dyn VsockBackend>,
 }
 
-impl VsockDeclaration {
+impl VsockSpec {
     pub fn new(
         guest_cid: u64,
         maximum_queue_size: u16,
@@ -129,9 +129,7 @@ impl VsockDeclaration {
             || maximum_queue_size == 0
             || !maximum_queue_size.is_power_of_two()
         {
-            return Err(DeviceError::InvalidLayout(
-                "invalid virtio-vsock declaration",
-            ));
+            return Err(DeviceError::InvalidLayout("invalid virtio-vsock spec"));
         }
         Ok(Self {
             guest_cid,
@@ -157,7 +155,7 @@ struct VsockDevice {
 }
 
 #[async_trait]
-impl DeviceDeclaration for VsockDeclaration {
+impl DeviceSpec for VsockSpec {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
             queue_count: QUEUE_COUNT,

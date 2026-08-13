@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
-use crate::device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
+use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
 use crate::interrupt::Interrupt;
@@ -26,7 +26,7 @@ const HEADER_SIZE: usize = 12;
 const MAXIMUM_FRAME_SIZE: usize = 65_536;
 
 #[async_trait]
-pub trait NetBackend: Send + Sync {
+pub trait NetworkBackend: Send + Sync {
     async fn transmit(&self, frame: Vec<u8>) -> Result<(), DeviceError>;
 
     fn has_frame(&self) -> bool;
@@ -37,19 +37,19 @@ pub trait NetBackend: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct NetDeclaration {
+pub struct NetworkSpec {
     mac: [u8; 6],
     queue_pairs: usize,
     maximum_queue_size: u16,
-    backend: Arc<dyn NetBackend>,
+    backend: Arc<dyn NetworkBackend>,
 }
 
-impl NetDeclaration {
+impl NetworkSpec {
     pub fn new(
         mac: [u8; 6],
         queue_pairs: usize,
         maximum_queue_size: u16,
-        backend: Arc<dyn NetBackend>,
+        backend: Arc<dyn NetworkBackend>,
     ) -> Result<Self, DeviceError> {
         if queue_pairs == 0 || queue_pairs > usize::from(u16::MAX) {
             return Err(DeviceError::InvalidLayout(
@@ -87,9 +87,9 @@ impl NetDeclaration {
     }
 }
 
-struct NetDevice {
+struct NetworkDevice {
     resources: DeviceResources,
-    backend: Arc<dyn NetBackend>,
+    backend: Arc<dyn NetworkBackend>,
     queue_states: Mutex<Vec<QueueState>>,
     wake: Notify,
     kicked: AtomicBool,
@@ -99,7 +99,7 @@ struct NetDevice {
 }
 
 #[async_trait]
-impl DeviceDeclaration for NetDeclaration {
+impl DeviceSpec for NetworkSpec {
     fn layout(&self) -> DeviceLayout {
         DeviceLayout {
             queue_count: self.queue_pairs * 2 + 1,
@@ -119,7 +119,7 @@ impl DeviceDeclaration for NetDeclaration {
     ) -> Result<Arc<dyn DeviceInstance>, DeviceError> {
         resources.validate(&self.layout())?;
         let queue_count = resources.queues.len();
-        Ok(Arc::new(NetDevice {
+        Ok(Arc::new(NetworkDevice {
             resources,
             backend: Arc::clone(&self.backend),
             queue_states: Mutex::new(vec![QueueState::new(); queue_count]),
@@ -133,7 +133,7 @@ impl DeviceDeclaration for NetDeclaration {
 }
 
 #[async_trait]
-impl DeviceInstance for NetDevice {
+impl DeviceInstance for NetworkDevice {
     fn kick(&self) {
         self.kicked.store(true, Ordering::Release);
         self.wake.notify_one();
@@ -168,7 +168,7 @@ impl DeviceInstance for NetDevice {
     }
 }
 
-impl NetDevice {
+impl NetworkDevice {
     async fn process_tx(&self) -> Result<(), DeviceError> {
         for pair in 0..self.active_queue_pairs() {
             loop {
@@ -421,16 +421,16 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{
-        NetBackend, NetDeclaration, VIRTIO_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC,
+        NetworkBackend, NetworkSpec, VIRTIO_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC,
         VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
     };
-    use crate::device::DeviceDeclaration;
+    use crate::device::DeviceSpec;
     use crate::error::DeviceError;
 
     struct TestBackend;
 
     #[async_trait]
-    impl NetBackend for TestBackend {
+    impl NetworkBackend for TestBackend {
         async fn transmit(&self, _frame: Vec<u8>) -> Result<(), DeviceError> {
             Ok(())
         }
@@ -447,10 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn declaration_exposes_modern_link_up_config() {
-        let declaration = NetDeclaration::new([0x02, 0, 0, 0, 0, 1], 4, 128, Arc::new(TestBackend))
-            .expect("valid declaration");
-        let layout = declaration.layout();
+    fn spec_exposes_modern_link_up_config() {
+        let spec = NetworkSpec::new([0x02, 0, 0, 0, 0, 1], 4, 128, Arc::new(TestBackend))
+            .expect("valid spec");
+        let layout = spec.layout();
         assert_eq!(layout.queue_count, 9);
         assert_eq!(layout.notifier_count, 10);
         assert_eq!(layout.required_features, VIRTIO_F_VERSION_1);
@@ -458,7 +458,7 @@ mod tests {
             layout.optional_features,
             VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_NET_F_CTRL_VQ | VIRTIO_NET_F_MQ
         );
-        let config = declaration.config_bytes();
+        let config = spec.config_bytes();
         assert_eq!(&config[..6], &[0x02, 0, 0, 0, 0, 1]);
         assert_eq!(
             u16::from_le_bytes(config[6..8].try_into().expect("status")),
@@ -468,7 +468,7 @@ mod tests {
             u16::from_le_bytes(config[8..10].try_into().expect("pairs")),
             4
         );
-        assert!(NetDeclaration::new([0; 6], 1, 128, Arc::new(TestBackend)).is_err());
-        assert!(NetDeclaration::new([1, 0, 0, 0, 0, 1], 1, 128, Arc::new(TestBackend)).is_err());
+        assert!(NetworkSpec::new([0; 6], 1, 128, Arc::new(TestBackend)).is_err());
+        assert!(NetworkSpec::new([1, 0, 0, 0, 0, 1], 1, 128, Arc::new(TestBackend)).is_err());
     }
 }

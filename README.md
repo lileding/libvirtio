@@ -15,7 +15,7 @@ The embedding monitor follows this sequence:
 
 1. Observe transport power-on and obtain the DMA mapping, queue layouts, and
    interrupt notifiers.
-2. Construct a device declaration and inspect `DeviceDeclaration::layout()`.
+2. Construct a device spec and inspect `DeviceSpec::layout()`.
 3. Negotiate the declared virtio features with the guest transport.
 4. Call `activate()` with `DeviceResources` to obtain a `DeviceInstance`.
 5. Call `kick()` when the transport reports a guest doorbell. The monitor owns
@@ -31,11 +31,11 @@ specific file-descriptor, kqueue, PCI, MMIO, or hypervisor ABI.
 
 | Device | Current scope |
 | --- | --- |
-| `BlockDeclaration` | Raw sector-aligned regular-file virtio-blk; one to four request queues with standard MQ negotiation, read, write, and flush; asynchronous blocking-file work through Tokio. |
-| `NetDeclaration` | TAP-backed virtio-net; up to four RX/TX queue pairs, control queue, MAC address, and link-up status. No checksum or GSO offload is advertised. |
-| `VsockDeclaration` | Modern virtio-vsock STREAM and SEQPACKET transport, packet validation, negotiated type enforcement, and revocable lifecycle hooks. |
-| `RngDeclaration` | Modern virtio-rng filled by the platform `arc4random_buf` entropy API on targets where Rust libc declares it. |
-| `FsDeclaration` | Read-only virtio-fs export of one host directory. It implements the FUSE session handshake plus lookup, attributes, open, read, directory listing, and statfs over a hiprio queue plus one or more request queues. |
+| `BlockSpec` | Raw sector-aligned regular-file virtio-blk; one to four request queues with standard MQ negotiation, read, write, and flush; asynchronous blocking-file work through Tokio. |
+| `NetworkSpec` | TAP-backed virtio-net; up to four RX/TX queue pairs, control queue, MAC address, and link-up status. No checksum or GSO offload is advertised. |
+| `VsockSpec` | Modern virtio-vsock STREAM and SEQPACKET transport, packet validation, negotiated type enforcement, and revocable lifecycle hooks. |
+| `RngSpec` | Modern virtio-rng filled by the platform `arc4random_buf` entropy API on targets where Rust libc declares it. |
+| `FsSpec` | Read-only virtio-fs export of one host directory. It implements the FUSE session handshake plus lookup, attributes, open, read, directory listing, and statfs over a hiprio queue plus one or more request queues. |
 
 The virtio-fs implementation does not offer DAX, FUSE notifications, writes,
 xattrs, locks, caching guarantees, or symlink traversal. The following are
@@ -52,7 +52,7 @@ cargo build --release
 The crate can be imported by Rust callers as:
 
 ```rust
-use virtiod::{BlockDeclaration, DeviceDeclaration, DeviceInstance};
+use virtiod::{BlockSpec, DeviceSpec, DeviceInstance};
 ```
 
 Release builds emit both a Rust `rlib` and `target/release/libvirtiod.so`.
