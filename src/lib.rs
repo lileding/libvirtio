@@ -4,11 +4,13 @@
 //! runtime, and device lifecycle.  This crate owns only virtio device logic.
 
 pub mod block;
+pub mod console;
 pub mod device;
 pub mod dma;
 pub mod error;
 pub mod fs;
 pub mod interrupt;
+pub mod memory;
 pub mod network;
 pub mod queue;
 #[cfg(any(
@@ -30,11 +32,15 @@ pub mod rng;
 pub mod vsock;
 
 pub use block::{BlockConfig, BlockDevice, BlockSpec};
-pub use device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
+pub use console::{ConsoleBackend, ConsoleSpec};
+pub use device::{DeviceConfig, DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 pub use dma::{DmaLease, DmaMemory, DmaPart, DmaRange, DmaSegment};
 pub use error::{DeviceDownReason, DeviceError};
 pub use fs::{FsConfig, FsSpec, VIRTIO_F_VERSION_1 as FS_F_VERSION_1, VIRTIO_FS_TAG_SIZE};
 pub use interrupt::{Interrupt, InterruptNotifier};
+pub use memory::{
+    MemoryBackend, MemoryConfig, MemoryConfigState, MemoryRequest, MemoryResponse, MemorySpec,
+};
 pub use network::{
     NetworkBackend, NetworkSpec, VIRTIO_F_VERSION_1 as NETWORK_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ,
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,

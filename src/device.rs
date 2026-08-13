@@ -7,6 +7,12 @@ use crate::error::{DeviceDownReason, DeviceError};
 use crate::interrupt::InterruptNotifier;
 use crate::queue::QueueLayout;
 
+pub trait DeviceConfig: Send + Sync {
+    fn size(&self) -> usize;
+    fn read(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DeviceError>;
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceLayout {
     pub queue_count: usize,
@@ -64,6 +70,10 @@ pub trait DeviceInstance: Send + Sync {
     fn kick(&self);
 
     fn stop(&self, reason: DeviceDownReason);
+
+    fn config(&self) -> Option<Arc<dyn DeviceConfig>> {
+        None
+    }
 
     /// Runs until `stop()` has revoked this device's DMA generation.
     ///
