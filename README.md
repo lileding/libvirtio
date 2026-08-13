@@ -31,13 +31,16 @@ specific file-descriptor, kqueue, PCI, MMIO, or hypervisor ABI.
 
 | Device | Current scope |
 | --- | --- |
-| `BlockDeclaration` | Raw sector-aligned regular-file virtio-blk; read, write, and flush; asynchronous blocking-file work through Tokio. |
+| `BlockDeclaration` | Raw sector-aligned regular-file virtio-blk; one to four request queues with standard MQ negotiation, read, write, and flush; asynchronous blocking-file work through Tokio. |
 | `NetDeclaration` | TAP-backed virtio-net; up to four RX/TX queue pairs, control queue, MAC address, and link-up status. No checksum or GSO offload is advertised. |
 | `VsockDeclaration` | Modern virtio-vsock STREAM and SEQPACKET transport, packet validation, negotiated type enforcement, and revocable lifecycle hooks. |
 | `RngDeclaration` | Modern virtio-rng filled by the platform `arc4random_buf` entropy API on targets where Rust libc declares it. |
+| `FsDeclaration` | Read-only virtio-fs export of one host directory. It implements the FUSE session handshake plus lookup, attributes, open, read, directory listing, and statfs over a hiprio queue plus one or more request queues. |
 
-The following are deliberately not claimed yet: full virtio-net offloads,
-guest-initiated vsock listeners, SOCK_DGRAM, and virtio-fs.
+The virtio-fs implementation does not offer DAX, FUSE notifications, writes,
+xattrs, locks, caching guarantees, or symlink traversal. The following are
+also deliberately not claimed yet: full virtio-net offloads,
+guest-initiated vsock listeners, and SOCK_DGRAM.
 
 ## Build
 

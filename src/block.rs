@@ -13,6 +13,7 @@ use crate::error::{DeviceDownReason, DeviceError};
 use crate::queue::{DescriptorChain, QueueState, VirtQueue};
 
 pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+pub const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
@@ -474,7 +475,12 @@ impl DeviceDeclaration for BlockDeclaration {
             maximum_queue_size: self.imm_maximum_queue_size,
             notifier_count: self.imm_queue_count,
             required_features: VIRTIO_F_VERSION_1,
-            optional_features: VIRTIO_BLK_F_FLUSH,
+            optional_features: VIRTIO_BLK_F_FLUSH
+                | if self.imm_queue_count > 1 {
+                    VIRTIO_BLK_F_MQ
+                } else {
+                    0
+                },
         }
     }
 
@@ -570,8 +576,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BlockDeclaration, BlockDevice, BlockRequestType, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_S_OK,
-        VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_OUT, VIRTIO_F_VERSION_1,
+        BlockDeclaration, BlockDevice, BlockRequest, BlockRequestType, VIRTIO_BLK_F_FLUSH,
+        VIRTIO_BLK_F_MQ, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_OUT,
+        VIRTIO_F_VERSION_1,
     };
     use crate::device::{DeviceDeclaration, DeviceInstance, DeviceResources};
     use crate::dma::{DmaMemory, DmaRange, DmaSegment};
@@ -841,6 +848,74 @@ mod tests {
         fs::remove_file(path).expect("remove image");
     }
 
+    #[tokio::test]
+    async fn backend_short_read_returns_ioerr_and_next_write_recovers() {
+        let path = image_path();
+        fs::write(&path, vec![0u8; 4096]).expect("create image");
+        let mut memory = [0u8; 4096];
+        let declaration = BlockDeclaration::open(&path, 1, 128).expect("declare image");
+        let device = BlockDevice::open(
+            &declaration,
+            resources(&mut memory, Arc::new(TestNotifier::default())),
+        )
+        .expect("open image");
+
+        fs::write(&path, []).expect("truncate image beneath open backend");
+        let failed_read = BlockRequest {
+            request_type: BlockRequestType::In,
+            sector: 0,
+            payload: vec![DmaRange::new(0x1200, 512)],
+            status: DmaRange::new(0x1400, 1),
+        };
+        assert_eq!(
+            device
+                .execute(&device.resources().dma, failed_read)
+                .await
+                .expect("complete failed read")
+                .status,
+            VIRTIO_BLK_S_IOERR
+        );
+
+        let status = device
+            .resources()
+            .dma
+            .lease(DmaRange::new(0x1400, 1))
+            .expect("status");
+        assert_eq!(
+            unsafe { status.parts()[0].read_slice() },
+            &[VIRTIO_BLK_S_IOERR]
+        );
+        drop(status);
+
+        let mut payload = device
+            .resources()
+            .dma
+            .lease(DmaRange::new(0x1200, 512))
+            .expect("payload");
+        unsafe { payload.parts_mut()[0].write_slice() }.fill(b'R');
+        drop(payload);
+        let recovered_write = BlockRequest {
+            request_type: BlockRequestType::Out,
+            sector: 0,
+            payload: vec![DmaRange::new(0x1200, 512)],
+            status: DmaRange::new(0x1400, 1),
+        };
+        assert_eq!(
+            device
+                .execute(&device.resources().dma, recovered_write)
+                .await
+                .expect("complete recovered write")
+                .status,
+            VIRTIO_BLK_S_OK
+        );
+        assert_eq!(
+            fs::read(&path).expect("read recovered image"),
+            vec![b'R'; 512]
+        );
+        device.stop(DeviceDownReason::Stop);
+        fs::remove_file(path).expect("remove image");
+    }
+
     #[test]
     fn declaration_exposes_immutable_block_config() {
         let path = image_path();
@@ -853,6 +928,18 @@ mod tests {
                 read_only: false,
                 queue_count: 4,
             }
+        );
+        fs::remove_file(path).expect("remove image");
+    }
+
+    #[test]
+    fn multiqueue_declaration_advertises_multiqueue_feature() {
+        let path = image_path();
+        fs::write(&path, vec![0u8; 4096]).expect("create image");
+        let declaration = BlockDeclaration::open(&path, 4, 128).expect("declare image");
+        assert_eq!(
+            declaration.layout().optional_features,
+            VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_MQ
         );
         fs::remove_file(path).expect("remove image");
     }

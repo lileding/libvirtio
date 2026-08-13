@@ -173,8 +173,9 @@ impl DeviceDeclaration for VsockDeclaration {
         resources: DeviceResources,
     ) -> Result<Arc<dyn DeviceInstance>, DeviceError> {
         resources.validate(&self.layout())?;
-        let stream_supported = resources.negotiated_features & VIRTIO_VSOCK_F_STREAM != 0
-            || resources.negotiated_features & VIRTIO_VSOCK_F_SEQPACKET == 0;
+        // STREAM is the baseline virtio-vsock socket type.  Linux may
+        // negotiate SEQPACKET without acknowledging the separate STREAM bit.
+        let stream_supported = true;
         let seqpacket_supported = resources.negotiated_features & VIRTIO_VSOCK_F_SEQPACKET != 0;
         Ok(Arc::new(VsockDevice {
             own_mut_queue_states: Mutex::new(vec![QueueState::new(); QUEUE_COUNT]),

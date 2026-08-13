@@ -7,6 +7,7 @@ pub mod block;
 pub mod device;
 pub mod dma;
 pub mod error;
+pub mod fs;
 pub mod interrupt;
 pub mod net;
 pub mod queue;
@@ -32,6 +33,7 @@ pub use block::{BlockConfig, BlockDeclaration, BlockDevice};
 pub use device::{DeviceDeclaration, DeviceInstance, DeviceLayout, DeviceResources};
 pub use dma::{DmaLease, DmaMemory, DmaPart, DmaRange, DmaSegment};
 pub use error::{DeviceDownReason, DeviceError};
+pub use fs::{FsConfig, FsDeclaration, VIRTIO_F_VERSION_1 as FS_F_VERSION_1, VIRTIO_FS_TAG_SIZE};
 pub use interrupt::{Interrupt, InterruptNotifier};
 pub use net::{
     NetBackend, NetDeclaration, VIRTIO_F_VERSION_1 as NET_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ,
