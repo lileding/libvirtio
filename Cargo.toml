@@ -19,9 +19,9 @@ memory = []
 network = []
 rng = []
 vsock = []
-runv = ["block", "network", "vsock", "fs"]
+container = ["block", "network", "vsock", "fs"]
 vm = ["block", "console", "memory", "network", "rng"]
-full = ["runv", "vm"]
+full = ["container", "vm"]
 
 [dependencies]
 async-trait = "0.1"
