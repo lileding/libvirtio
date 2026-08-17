@@ -20,7 +20,7 @@ network = []
 rng = []
 vsock = []
 container = ["block", "network", "vsock", "fs"]
-vm = ["block", "console", "memory", "network", "rng"]
+vm = ["block", "console", "network", "rng"]
 full = ["container", "vm"]
 
 [dependencies]
