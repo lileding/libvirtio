@@ -250,8 +250,14 @@ fn write_chain(
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsoleBackend, ConsoleSpec, VIRTIO_CONSOLE_F_MULTIPORT, VIRTIO_F_VERSION_1};
+    use super::{
+        ConsoleBackend, ConsoleSpec, VIRTIO_CONSOLE_F_MULTIPORT, VIRTIO_F_VERSION_1, read_chain,
+        writable_capacity, write_chain,
+    };
     use crate::device::DeviceSpec;
+    use crate::dma::{DmaMemory, DmaSegment};
+    use crate::queue::{Descriptor, DescriptorChain};
+    use std::ptr::NonNull;
     use std::sync::Arc;
 
     struct NullBackend;
@@ -276,5 +282,72 @@ mod tests {
         assert_eq!(layout.queue_count, 2);
         assert_eq!(layout.required_features, VIRTIO_F_VERSION_1);
         assert_eq!(layout.optional_features & VIRTIO_CONSOLE_F_MULTIPORT, 0);
+    }
+
+    fn mapped_memory(size: usize) -> (DmaMemory, Box<[u8]>) {
+        let mut bytes = vec![0; size].into_boxed_slice();
+        let base = NonNull::new(bytes.as_mut_ptr()).expect("test mapping is non-null");
+        let segment = unsafe { DmaSegment::new(0, base, size) };
+        (
+            DmaMemory::new(1, vec![segment]).expect("test mapping is valid"),
+            bytes,
+        )
+    }
+
+    #[test]
+    fn console_transmit_reads_readable_descriptor_chain() {
+        let (memory, mut bytes) = mapped_memory(4);
+        bytes.copy_from_slice(b"out!");
+        let chain = DescriptorChain {
+            head: 0,
+            descriptors: vec![Descriptor {
+                address: 0,
+                length: 4,
+                flags: 0,
+                next: 0,
+            }],
+        };
+        assert_eq!(read_chain(&memory, &chain).expect("read chain"), b"out!");
+    }
+
+    #[test]
+    fn console_receive_writes_across_writable_descriptors() {
+        let (memory, bytes) = mapped_memory(8);
+        let chain = DescriptorChain {
+            head: 0,
+            descriptors: vec![
+                Descriptor {
+                    address: 0,
+                    length: 4,
+                    flags: 2,
+                    next: 0,
+                },
+                Descriptor {
+                    address: 4,
+                    length: 4,
+                    flags: 2,
+                    next: 0,
+                },
+            ],
+        };
+        assert_eq!(writable_capacity(&chain).expect("capacity"), 8);
+        write_chain(&memory, &chain, b"console!").expect("write chain");
+        assert_eq!(&bytes[..], b"console!");
+    }
+
+    #[test]
+    fn console_rejects_wrong_descriptor_direction() {
+        let chain = DescriptorChain {
+            head: 0,
+            descriptors: vec![Descriptor {
+                address: 0,
+                length: 4,
+                flags: 0,
+                next: 0,
+            }],
+        };
+        assert!(writable_capacity(&chain).is_err());
+        let (memory, _bytes) = mapped_memory(4);
+        assert!(read_chain(&memory, &chain).is_ok());
     }
 }
