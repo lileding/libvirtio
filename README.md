@@ -1,13 +1,13 @@
-# virtiod
+# libvirtio
 
-`virtiod` is a reusable, transport-independent Rust library implementing
+`libvirtio` is a reusable, transport-independent Rust library implementing
 modern virtio devices.  It is intentionally not a daemon.  An embedding
 monitor owns the transport, its reactor, the DMA mapping, and the device
 lifecycle; this crate owns only virtio device behaviour.
 
-The current primary consumer is `runv`, which binds the library to DragonFly
-vmm's vPCIe provider ABI.  The library is also intended to be embeddable by a
-future monitor using a different transport, such as PCI or MMIO.
+Current consumers are `runv` and `vmon`, which bind the library to the
+DragonFlyBSD vmmfs modern virtio-PCI transport.  It remains embeddable by a
+monitor using another transport, such as PCI or MMIO.
 
 ## Architecture
 
@@ -52,10 +52,10 @@ cargo build --release
 The crate can be imported by Rust callers as:
 
 ```rust
-use virtiod::{BlockSpec, DeviceSpec, DeviceInstance};
+use virtio::{BlockSpec, DeviceSpec, DeviceInstance};
 ```
 
-Release builds emit both a Rust `rlib` and `target/release/libvirtiod.so`.
+Release builds emit both a Rust `rlib` and `target/release/libvirtio.so`.
 The shared object currently has no published C ABI or stable exported API.
 That boundary will be designed separately once a C monitor has a concrete
 transport/reactor contract; Rust traits and Tokio objects are not exposed as
