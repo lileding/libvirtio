@@ -1,0 +1,17 @@
+[package]
+name = "virtiod"
+version = "0.1.1"
+edition = "2024"
+license = "MIT"
+description = "Deprecated compatibility crate; use libvirtio instead"
+readme = "README.md"
+repository = "https://github.com/lileding/libvirtio"
+homepage = "https://github.com/lileding/libvirtio"
+keywords = ["virtio", "virtualization", "vmm"]
+categories = ["asynchronous", "virtualization"]
+
+[dependencies]
+virtio = { package = "libvirtio", version = "=0.1.0", path = "../.." }
+
+[lib]
+name = "virtiod"

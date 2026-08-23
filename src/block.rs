@@ -603,11 +603,16 @@ mod tests {
     }
 
     fn image_path() -> PathBuf {
+        static NEXT_IMAGE: AtomicUsize = AtomicUsize::new(0);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("libvirtiod-block-{unique}.raw"))
+        let sequence = NEXT_IMAGE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "libvirtio-block-{}-{unique}-{sequence}.raw",
+            std::process::id()
+        ))
     }
 
     fn resources(memory: &mut [u8], notifier: Arc<dyn InterruptNotifier>) -> DeviceResources {
