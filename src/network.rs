@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
+use crate::NetworkBackend;
 use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
@@ -24,17 +25,6 @@ const VIRTIO_NET_ERR: u8 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 const HEADER_SIZE: usize = 12;
 const MAXIMUM_FRAME_SIZE: usize = 65_536;
-
-#[async_trait]
-pub trait NetworkBackend: Send + Sync {
-    async fn transmit(&self, frame: Vec<u8>) -> Result<(), DeviceError>;
-
-    fn has_frame(&self) -> bool;
-
-    fn take_frame(&self) -> Option<Vec<u8>>;
-
-    fn shutdown(&self);
-}
 
 #[derive(Clone)]
 pub struct NetworkSpec {

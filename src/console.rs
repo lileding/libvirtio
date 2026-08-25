@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
+use crate::ConsoleBackend;
 use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
@@ -21,14 +22,6 @@ const QUEUE_RECEIVE: usize = 0;
 const QUEUE_TRANSMIT: usize = 1;
 const QUEUE_COUNT: usize = 2;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
-
-#[async_trait]
-pub trait ConsoleBackend: Send + Sync {
-    fn has_input(&self) -> bool;
-    fn read_input(&self, maximum: usize) -> Option<Vec<u8>>;
-    async fn write_output(&self, bytes: Vec<u8>) -> Result<(), DeviceError>;
-    fn shutdown(&self);
-}
 
 pub struct ConsoleSpec {
     maximum_queue_size: u16,

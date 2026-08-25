@@ -3,6 +3,7 @@
 //! The embedding monitor owns PCIe/MMIO transport, DMA mapping, the async
 //! runtime, and device lifecycle.  This crate owns only virtio device logic.
 
+mod backend;
 #[cfg(feature = "block")]
 pub mod block;
 #[cfg(feature = "console")]
@@ -40,10 +41,11 @@ pub mod rng;
 #[cfg(feature = "vsock")]
 pub mod vsock;
 
+pub use backend::{ConsoleBackend, NetworkBackend};
 #[cfg(feature = "block")]
 pub use block::{BlockConfig, BlockDevice, BlockSpec};
 #[cfg(feature = "console")]
-pub use console::{ConsoleBackend, ConsoleSpec};
+pub use console::ConsoleSpec;
 pub use device::{DeviceConfig, DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
 pub use dma::{DmaLease, DmaMemory, DmaPart, DmaRange, DmaSegment};
 pub use error::{DeviceDownReason, DeviceError};
@@ -56,8 +58,8 @@ pub use memory::{
 };
 #[cfg(feature = "network")]
 pub use network::{
-    NetworkBackend, NetworkSpec, VIRTIO_F_VERSION_1 as NETWORK_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ,
-    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
+    NetworkSpec, VIRTIO_F_VERSION_1 as NETWORK_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC,
+    VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
 };
 pub use queue::{QueueLayout, QueueState, VirtQueue};
 #[cfg(all(
