@@ -129,9 +129,11 @@ impl DeviceInstance for NetworkDevice {
         self.wake.notify_one();
     }
 
-    fn stop(&self, _reason: DeviceDownReason) {
+    fn stop(&self, reason: DeviceDownReason) {
         self.down.store(true, Ordering::Release);
-        self.backend.shutdown();
+        if shuts_down_backend(reason) {
+            self.backend.shutdown();
+        }
         self.resources.dma.revoke();
         self.wake.notify_waiters();
     }
@@ -156,6 +158,10 @@ impl DeviceInstance for NetworkDevice {
             self.process_rx().await?;
         }
     }
+}
+
+fn shuts_down_backend(reason: DeviceDownReason) -> bool {
+    reason != DeviceDownReason::Reset
 }
 
 impl NetworkDevice {
@@ -412,10 +418,10 @@ mod tests {
 
     use super::{
         NetworkBackend, NetworkSpec, VIRTIO_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC,
-        VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
+        VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP, shuts_down_backend,
     };
     use crate::device::DeviceSpec;
-    use crate::error::DeviceError;
+    use crate::error::{DeviceDownReason, DeviceError};
 
     struct TestBackend;
 
@@ -434,6 +440,14 @@ mod tests {
         }
 
         fn shutdown(&self) {}
+    }
+
+    #[test]
+    fn reset_preserves_network_backend() {
+        assert!(!shuts_down_backend(DeviceDownReason::Reset));
+        assert!(shuts_down_backend(DeviceDownReason::Stop));
+        assert!(shuts_down_backend(DeviceDownReason::Revoked));
+        assert!(shuts_down_backend(DeviceDownReason::SurpriseRemoval));
     }
 
     #[test]
