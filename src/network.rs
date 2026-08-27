@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
 use crate::NetworkBackend;
-use crate::device::{DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
+use crate::device::{
+    DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec, closes_host_backend,
+};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
 use crate::interrupt::Interrupt;
@@ -131,7 +133,7 @@ impl DeviceInstance for NetworkDevice {
 
     fn stop(&self, reason: DeviceDownReason) {
         self.down.store(true, Ordering::Release);
-        if shuts_down_backend(reason) {
+        if closes_host_backend(reason) {
             self.backend.shutdown();
         }
         self.resources.dma.revoke();
@@ -158,10 +160,6 @@ impl DeviceInstance for NetworkDevice {
             self.process_rx().await?;
         }
     }
-}
-
-fn shuts_down_backend(reason: DeviceDownReason) -> bool {
-    reason != DeviceDownReason::Reset
 }
 
 impl NetworkDevice {
@@ -418,10 +416,10 @@ mod tests {
 
     use super::{
         NetworkBackend, NetworkSpec, VIRTIO_F_VERSION_1, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC,
-        VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP, shuts_down_backend,
+        VIRTIO_NET_F_MQ, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
     };
     use crate::device::DeviceSpec;
-    use crate::error::{DeviceDownReason, DeviceError};
+    use crate::error::DeviceError;
 
     struct TestBackend;
 
@@ -440,14 +438,6 @@ mod tests {
         }
 
         fn shutdown(&self) {}
-    }
-
-    #[test]
-    fn reset_preserves_network_backend() {
-        assert!(!shuts_down_backend(DeviceDownReason::Reset));
-        assert!(shuts_down_backend(DeviceDownReason::Stop));
-        assert!(shuts_down_backend(DeviceDownReason::Revoked));
-        assert!(shuts_down_backend(DeviceDownReason::SurpriseRemoval));
     }
 
     #[test]

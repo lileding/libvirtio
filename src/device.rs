@@ -65,6 +65,10 @@ pub trait DeviceSpec: Send + Sync {
     ) -> Result<Arc<dyn DeviceInstance>, DeviceError>;
 }
 
+pub(crate) fn closes_host_backend(reason: DeviceDownReason) -> bool {
+    reason == DeviceDownReason::SurpriseRemoval
+}
+
 #[async_trait]
 pub trait DeviceInstance: Send + Sync {
     fn kick(&self);
@@ -81,4 +85,18 @@ pub trait DeviceInstance: Send + Sync {
     /// deliberately non-blocking so a transport can continue to receive
     /// power, reset, and removal messages while I/O is in flight.
     async fn run(&self) -> Result<(), DeviceError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::closes_host_backend;
+    use crate::error::DeviceDownReason;
+
+    #[test]
+    fn only_surprise_removal_closes_host_backend() {
+        assert!(!closes_host_backend(DeviceDownReason::Stop));
+        assert!(!closes_host_backend(DeviceDownReason::Reset));
+        assert!(!closes_host_backend(DeviceDownReason::Revoked));
+        assert!(closes_host_backend(DeviceDownReason::SurpriseRemoval));
+    }
 }

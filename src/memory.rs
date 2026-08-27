@@ -6,7 +6,9 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, watch};
 
-use crate::device::{DeviceConfig, DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec};
+use crate::device::{
+    DeviceConfig, DeviceInstance, DeviceLayout, DeviceResources, DeviceSpec, closes_host_backend,
+};
 use crate::dma::{DmaMemory, DmaRange};
 use crate::error::{DeviceDownReason, DeviceError};
 use crate::interrupt::Interrupt;
@@ -246,9 +248,11 @@ impl DeviceInstance for MemoryDevice {
     fn kick(&self) {
         self.wake.notify_one();
     }
-    fn stop(&self, _reason: DeviceDownReason) {
+    fn stop(&self, reason: DeviceDownReason) {
         self.down.store(true, Ordering::Release);
-        self.backend.shutdown();
+        if closes_host_backend(reason) {
+            self.backend.shutdown();
+        }
         self.resources.dma.revoke();
         self.wake.notify_waiters();
     }
